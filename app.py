@@ -1,22 +1,23 @@
-# (Pegar aquí el código completo que te pasé)
+# app.py
+import os
+from flask import Flask, jsonify
+from flask_cors import CORS
 
-# Crear requirements.txt
-nano requirements.txt
-# (Pegar la lista de librerías que te pasé)
+app = Flask(__name__)
 
-# Crear Procfile
-nano Procfile
-# (Pegar: web: gunicorn app:app)
+# CORS: permití el frontend real desde env
+CORS(app, resources={r"/*": {"origins": os.getenv("CORS_ORIGIN", "*")}})
 
-# Iniciar git y conectar con GitHub
-git init
-git add .
-git commit -m "backend limpio listo"
-git branch -M main
-git remote add origin 
-https://github.com/SolucionesTVB/noa-cobros-backend-clean.git
-git push -u origin main
-<PEGA 
-AQUÍ EL app.py COMPLETO QUE 
-TE DI EN EL MENSAJE ANTERIOR
-(el que tiene /facturas, /upload-file, /notificar y /debug-routes)>
+@app.get("/health")
+def health():
+    return jsonify(status="ok")
+
+# Endpoints mínimos para probar que vive
+@app.get("/")
+def root():
+    return jsonify(service="noa-cobros-backend", ok=True)
+
+@app.get("/invoices")
+def invoices():
+    # responder 401 si luego activás auth; por ahora devolvemos demo
+    return jsonify(total=0, items=[])
