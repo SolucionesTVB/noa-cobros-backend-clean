@@ -1,0 +1,13 @@
+# Ignorar base de datos local
+*.db
+
+# Ignorar scripts de prueba
+*.sh
+
+# Ignorar facturas de ejemplo
+*.json
+
+# Ignorar archivos temporales de Python y Mac
+__pycache__/
+*.pyc
+.DS_Store
