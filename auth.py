@@ -3,8 +3,7 @@ from werkzeug.security import generate_password_hash, check_password_hash
 from flask_jwt_extended import create_access_token, jwt_required, get_jwt_identity
 from datetime import timedelta
 import os
-
-# importar db desde el módulo correcto (app / application / main)
+# importar db desde el módulo correcto
 try:
     from app import db
 except Exception:
@@ -12,7 +11,6 @@ except Exception:
         from application import db
     except Exception:
         from main import db
-
 from models import User
 
 bp = Blueprint("auth", __name__, url_prefix="/auth")
@@ -71,7 +69,6 @@ def admin_create_user():
     else: return jsonify({"error":"modelo User sin campo password"}), 500
     if parent_username and hasattr(u,"parent_id"):
         parent = User.query.filter_by(username=parent_username).first()
-        if parent and getattr(parent,"id",None):
-            u.parent_id = parent.id
+        if parent and getattr(parent,"id",None): u.parent_id = parent.id
     db.session.add(u); db.session.commit()
     return jsonify({"ok":True})
