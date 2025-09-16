@@ -1,8 +1,46 @@
 from flask import Flask, request, jsonify
+<<<<<<< HEAD
+=======
+<<<<<<< HEAD
+import sqlite3
+
+app = Flask(__name__)
+
+# --- Base de datos ---
+def get_db():
+    conn = sqlite3.connect("database.db")
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def init_db():
+    db = get_db()
+    db.execute(
+        """CREATE TABLE IF NOT EXISTS facturas (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            cliente TEXT,
+            monto REAL,
+            vence TEXT,
+            estado TEXT DEFAULT 'pendiente',
+            telefono TEXT,
+            email TEXT,
+            canal TEXT,
+            notas TEXT
+        )"""
+    )
+    db.commit()
+
+# --- Rutas principales ---
+
+=======
+>>>>>>> feat/auth
 
 app = Flask(__name__)
 
 # Página principal (bienvenida)
+<<<<<<< HEAD
+=======
+>>>>>>> c7d68f0 (replace full backend app with clean version)
+>>>>>>> feat/auth
 @app.route("/")
 def home():
     return """
@@ -38,6 +76,60 @@ target="_blank">
     </html>
     """
 
+<<<<<<< HEAD
+=======
+<<<<<<< HEAD
+@app.route("/facturas", methods=["GET", "POST"])
+def facturas():
+    db = get_db()
+    if request.method == "POST":
+        data = request.get_json(force=True)
+        if isinstance(data, dict):
+            data = [data]
+        for factura in data:
+            db.execute(
+                "INSERT INTO facturas (cliente, monto, vence, telefono, email, canal, notas) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    factura.get("cliente"),
+                    factura.get("monto"),
+                    factura.get("vence"),
+                    factura.get("telefono"),
+                    factura.get("email"),
+                    factura.get("canal"),
+                    factura.get("notas"),
+                ),
+            )
+        db.commit()
+        return jsonify({"ok": True})
+    else:
+        rows = db.execute("SELECT * FROM facturas").fetchall()
+        return jsonify([dict(row) for row in rows])
+
+@app.route("/notificar", methods=["POST"])
+def notificar():
+    data = request.get_json(force=True)
+    ids = data.get("ids", [])
+    enviados = []
+    for factura_id in ids:
+        enviados.append({"id": factura_id, "resp": {"success": True}})
+    return jsonify({"ok": True, "enviados": enviados})
+
+@app.route("/facturas/clear", methods=["POST"])
+def clear_facturas():
+    try:
+        db = get_db()
+        db.execute("DELETE FROM facturas")
+        db.commit()
+        return jsonify({"ok": True, "msg": "Todas las facturas borradas"})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+# --- Inicializar DB ---
+if __name__ == "__main__":
+    init_db()
+    app.run(host="0.0.0.0", port=5000)
+=======
+>>>>>>> feat/auth
 # Lista de facturas en memoria
 facturas = []
 
@@ -75,3 +167,17 @@ def notificar():
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
 
+<<<<<<< HEAD
+=======
+>>>>>>> c7d68f0 (replace full backend app with clean version)
+>>>>>>> feat/auth
+
+# === JWT + rutas de auth (añadido) ===
+from flask_jwt_extended import JWTManager
+import os
+app.config["JWT_SECRET_KEY"] = os.getenv("JWT_SECRET_KEY", "noa_jwt_2025_super")
+jwt = JWTManager(app)
+
+from auth import bp as auth_bp
+app.register_blueprint(auth_bp)
+# === /fin añadido ===
