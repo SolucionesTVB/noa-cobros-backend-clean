@@ -4,14 +4,7 @@ from flask_jwt_extended import create_access_token, jwt_required, get_jwt_identi
 from datetime import timedelta
 import os
 # importar db desde el módulo correcto
-try:
-    from app import db
-except Exception:
-    try:
-        from application import db
-    except Exception:
-        from main import db
-from models import User
+from models import User, db
 
 bp = Blueprint("auth", __name__, url_prefix="/auth")
 
