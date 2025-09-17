@@ -17,7 +17,7 @@ def bootstrap_admin():
         return jsonify({"error":"unauthorized"}), 401
 
     q = db.session.query(User)
-    exists = q.filter(getattr(User,"role","")=="admin").first() if 
+    exists = q.filter(getattr(User,"role","")== "admin").first() if hasattr(User,"role") else None
 hasattr(User,"role") else None
     if exists:
         return jsonify({"error":"admin already exists"}), 409
