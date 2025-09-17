@@ -2,36 +2,89 @@ from flask import Blueprint, request, jsonify
 from werkzeug.security import generate_password_hash, check_password_hash
 from flask_jwt_extended import create_access_token, jwt_required, get_jwt_identity
 from datetime import timedelta
-import importlib, inspect, os
+import os, sys, inspect, importlib, pathlib, types
+from importlib.machinery import SourceFileLoader
+from importlib.util import spec_from_loader, module_from_spec
 
 bp = Blueprint("auth", __name__, url_prefix="/auth")
 
+# --- cache global para no re-escanear en cada request ---
+_RES_CACHE = {"db": None, "User": None, "ready": False}
+
+def _load_module_from_path(path: str, name: str) -> types.ModuleType | None:
+    try:
+        loader = SourceFileLoader(name, path)
+        spec = spec_from_loader(name, loader)
+        mod = module_from_spec(spec)
+        loader.exec_module(mod)
+        return mod
+    except Exception:
+        return None
+
 def _resolve_db_user():
-    """Encuentra db y el modelo de usuario, sin importar cómo se llame o dónde esté."""
-    db = None
-    User = None
-    # módulos donde normalmente viven db y los modelos
+    """Detecta dinámicamente el objeto db (Flask-SQLAlchemy) y la clase de usuario (tiene username + password[_hash])."""
+    if _RES_CACHE.get("ready"):
+        return _RES_CACHE["db"], _RES_CACHE["User"]
+
+    root = pathlib.Path(__file__).parent.resolve()
+    project_root = str(root)
+
+    candidates = []
+    imported = set()
+
+    # 1) intentar módulos conocidos
     for modname in ("app", "application", "main", "models"):
         try:
             M = importlib.import_module(modname)
+            if getattr(M, "__file__", "") and str(getattr(M, "__file__")).startswith(project_root):
+                candidates.append(M); imported.add(M.__name__)
         except Exception:
+            pass
+
+    # 2) escanear .py en el proyecto (profundidad 2) y cargarlos con loader
+    to_scan = []
+    for p in root.glob("*.py"):
+        to_scan.append(p)
+    for p in root.glob("*/*.py"):
+        to_scan.append(p)
+
+    idx = 0
+    for p in to_scan:
+        # omitir virtualenvs/archivos de build
+        if any(seg in str(p) for seg in ("/.venv/", "/venv/", "/site-packages/", "/__pycache__/")):
             continue
-        if not db:
-            db = getattr(M, "db", None)
-        # buscar clases con tabla y campos de usuario
+        name = f"_mod_{idx}"
+        idx += 1
+        m = _load_module_from_path(str(p), name)
+        if m and getattr(m, "__file__", "").startswith(project_root):
+            candidates.append(m)
+
+    db = None
+    User = None
+
+    # 3) buscar db y modelo usuario
+    for M in candidates:
+        # db: objeto con 'session' y, comúnmente, clase Model
+        cand_db = getattr(M, "db", None)
+        if cand_db and hasattr(cand_db, "session"):
+            db = db or cand_db
+
+        # modelo usuario: clase con __table__/__tablename__ y atributos username + (password o password_hash)
         for _, cls in inspect.getmembers(M, inspect.isclass):
-            has_table = hasattr(cls, "__table__") or hasattr(cls, "__tablename__")
-            if not has_table: 
-                continue
-            if not hasattr(cls, "username"): 
-                continue
-            if not (hasattr(cls, "password_hash") or hasattr(cls, "password")):
-                continue
-            User = cls
-            break
+            fields = set(dir(cls))
+            has_table = ("__table__" in fields) or ("__tablename__" in fields)
+            has_user = "username" in fields
+            has_pwd  = ("password_hash" in fields) or ("password" in fields)
+            if has_table and has_user and has_pwd:
+                User = User or cls
+
         if db and User:
-            return db, User
-    return None, None
+            break
+
+    _RES_CACHE["db"] = db
+    _RES_CACHE["User"] = User
+    _RES_CACHE["ready"] = True
+    return db, User
 
 def _set_password(u, raw):
     if hasattr(u, "password_hash"):
@@ -62,9 +115,15 @@ def bootstrap_admin():
     if not db or not User:
         return jsonify({"error":"server misconfigured (User/db not found)"}), 500
 
-    # ¿ya existe admin?
-    exists_admin = db.session.query(User).filter(getattr(User, "role", None) == "admin").first() if hasattr(User,"role") else db.session.query(User).first()
-    if exists_admin and hasattr(exists_admin, "role") and exists_admin.role == "admin":
+    # ¿Existe ya algún admin?
+    q = db.session.query(User)
+    exists_admin = None
+    if hasattr(User, "role"):
+        exists_admin = q.filter(getattr(User,"role")=="admin").first()
+    else:
+        exists_admin = q.first()  # si no hay role, asumimos que el primero ya existe
+
+    if exists_admin and getattr(exists_admin,"role",None) == "admin":
         return jsonify({"error":"admin already exists"}), 409
 
     data = request.get_json(force=True) or {}
@@ -73,11 +132,11 @@ def bootstrap_admin():
     if not username or not password:
         return jsonify({"error":"username/password requeridos"}), 400
 
-    # si NO hay admin, creamos uno
     u = User()
-    if hasattr(u, "username"): u.username = username
+    if hasattr(u,"username"): u.username = username
     _set_password(u, password)
     _set_role(u, "admin")
+
     db.session.add(u); db.session.commit()
 
     token = create_access_token(identity={"u": getattr(u,"username",username), "r": getattr(u,"role","admin")},
@@ -94,8 +153,7 @@ def login():
     username = (data.get("username") or "").strip().lower()
     password = data.get("password") or ""
 
-    q = db.session.query(User).filter(getattr(User,"username")==username)
-    u = q.first()
+    u = db.session.query(User).filter(getattr(User,"username")==username).first()
     if not u:
         return jsonify({"error":"credenciales inválidas"}), 401
 
