@@ -4,7 +4,6 @@ from flask_jwt_extended import create_access_token, jwt_required, get_jwt_identi
 get_jwt_identity
 from datetime import timedelta
 # OJO: estos imports asumen nombres comunes; si luego falla, cambiamos 
-aquí.
 from app import db
 from models import User
 import os
