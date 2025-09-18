@@ -3,10 +3,65 @@ from werkzeug.security import generate_password_hash, check_password_hash
 from flask_jwt_extended import create_access_token, jwt_required, get_jwt_identity
 from datetime import timedelta
 from app import db
-from models import User
 import os
 
 bp = Blueprint("auth", __name__, url_prefix="/auth")
+
+# ---- Utilidad: detectar la clase de usuario sin importar el nombre ----
+def _get_user_model():
+    """
+    Busca en todos los modelos (subclases de db.Model) uno que tenga:
+      - username
+      - y (password_hash o password)
+    Opcional: role
+    """
+    # Importa todos los modelos para que las clases estén registradas
+    try:
+        import models  # noqa: F401
+    except Exception:
+        pass
+
+    # Algunas apps registran modelos en _decl_class_registry (SQLAlchemy clásico)
+    registries = []
+    if hasattr(db.Model, "_decl_class_registry"):
+        registries.append(getattr(db.Model, "_decl_class_registry"))
+
+    # Y otras vía __subclasses__()
+    subclasses = list(db.Model.__subclasses__())
+
+    # Construir lista única de clases candidatas
+    candidates = set()
+    for reg in registries:
+        for k, v in reg.items():
+            if isinstance(v, type) and issubclass(v, db.Model):
+                candidates.add(v)
+    for cls in subclasses:
+        candidates.add(cls)
+
+    best = None
+    best_score = -1
+    for cls in candidates:
+        attrs = dir(cls)
+        has_user = any(a == "username" for a in attrs)
+        has_pass = any(a in ("password_hash", "password") for a in attrs)
+        score = 0
+        if has_user: score += 2
+        if has_pass: score += 2
+        if any(a == "role" for a in attrs): score += 1
+        if score > best_score and (has_user and has_pass):
+            best, best_score = cls, score
+
+    if not best:
+        raise RuntimeError(
+            "No se encontró un modelo de usuario: necesito una clase db.Model con "
+            "atributos 'username' y 'password_hash' (o 'password')."
+        )
+    return best
+
+def _password_get(u):
+    return getattr(u, "password_hash", None) or getattr(u, "password", None)
+
+# ----------------------- RUTAS -----------------------
 
 @bp.post("/bootstrap-admin")
 def bootstrap_admin():
@@ -14,8 +69,16 @@ def bootstrap_admin():
     if not key or key != os.getenv("BOOTSTRAP_ADMIN_KEY"):
         return jsonify({"error": "unauthorized"}), 401
 
+    User = _get_user_model()
+
+    # ¿ya hay admin?
     q = db.session.query(User)
-    exists = q.filter(getattr(User, "role", "") == "admin").first() if hasattr(User, "role") else None
+    exists = None
+    if hasattr(User, "role"):
+        exists = q.filter(getattr(User, "role") == "admin").first()
+    else:
+        exists = None
+
     if exists:
         return jsonify({"error": "admin already exists"}), 409
 
@@ -26,14 +89,12 @@ def bootstrap_admin():
         return jsonify({"error": "username/password requeridos"}), 400
 
     u = User()
-    if hasattr(u, "username"):
-        u.username = username
+    if hasattr(u, "username"): u.username = username
     if hasattr(u, "password_hash"):
         u.password_hash = generate_password_hash(password)
     elif hasattr(u, "password"):
         u.password = generate_password_hash(password)
-    if hasattr(u, "role"):
-        u.role = "admin"
+    if hasattr(u, "role"): u.role = "admin"
 
     db.session.add(u)
     db.session.commit()
@@ -46,6 +107,7 @@ def bootstrap_admin():
 
 @bp.post("/login")
 def login():
+    User = _get_user_model()
     data = request.get_json(force=True) or {}
     username = (data.get("username") or "").strip().lower()
     pwd = data.get("password") or ""
@@ -54,8 +116,8 @@ def login():
     if not u:
         return jsonify({"error": "credenciales inválidas"}), 401
 
-    ph = getattr(u, "password_hash", "") or getattr(u, "password", "")
-    if not check_password_hash(ph, pwd):
+    ph = _password_get(u)
+    if not ph or not check_password_hash(ph, pwd):
         return jsonify({"error": "credenciales inválidas"}), 401
 
     tok = create_access_token(
@@ -67,6 +129,7 @@ def login():
 @bp.post("/admin/create-user")
 @jwt_required()
 def admin_create_user():
+    User = _get_user_model()
     ident = get_jwt_identity() or {}
     me = db.session.query(User).filter(getattr(User, "username") == ident.get("u", "")).first()
     if not me or not (getattr(me, "role", None) in ("admin", "superadmin")):
@@ -84,8 +147,7 @@ def admin_create_user():
         return jsonify({"error": "usuario ya existe"}), 409
 
     u = User()
-    if hasattr(u, "username"):
-        u.username = username
+    if hasattr(u, "username"): u.username = username
     if hasattr(u, "password_hash"):
         u.password_hash = generate_password_hash(pwd)
     elif hasattr(u, "password"):
