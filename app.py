@@ -2,7 +2,7 @@ from flask import Flask, jsonify
 from flask_sqlalchemy import SQLAlchemy
 import os
 
-# instancia global (para from app import db)
+# instancia global (para "from app import db")
 db = SQLAlchemy()
 
 def _normalize_db_url(raw: str) -> str:
@@ -19,14 +19,14 @@ def create_app():
     app = Flask(__name__)
 
     # --- DB ---
-    url = _normalize_db_url(os.getenv("DATABASE_URL", 
-"sqlite:///local.db"))
+    url = _normalize_db_url(os.getenv("DATABASE_URL", "sqlite:///local.db"))
     app.config["SQLALCHEMY_DATABASE_URI"] = url
     app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
     db.init_app(app)
 
-    # >>> CREA TABLAS SI NO EXISTEN <<<
+    # Importar modelos y crear tablas (import models ANTES de create_all)
     with app.app_context():
+        import models  # registra clases para que create_all sepa qué tablas crear
         db.create_all()
 
     @app.get("/health")
@@ -35,34 +35,11 @@ def create_app():
 
     # --- Auth/JWT ---
     from flask_jwt_extended import JWTManager
-    app.config["JWT_SECRET_KEY"] = os.getenv("JWT_SECRET_KEY", 
-"noa_jwt_2025_super")
-    JWTManager(app)
-
-    from auth import bp as auth_bp
-    app.register_blueprint(auth_bp)
-
-    return app
-
-
-    # --- DB ---
-    url = _normalize_db_url(os.getenv("DATABASE_URL", "sqlite:///local.db"))
-    app.config["SQLALCHEMY_DATABASE_URI"] = url
-    app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
-    db.init_app(app)
-
-    @app.get("/health")
-    def health():
-        return jsonify(ok=True)
-
-    # --- Auth/JWT y blueprint /auth ---
-    from flask_jwt_extended import JWTManager
     app.config["JWT_SECRET_KEY"] = os.getenv("JWT_SECRET_KEY", "noa_jwt_2025_super")
     JWTManager(app)
 
     from auth import bp as auth_bp
     app.register_blueprint(auth_bp)
-    # --- fin auth ---
 
     return app
 
