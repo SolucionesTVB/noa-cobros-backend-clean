@@ -7,113 +7,105 @@ import os
 
 bp = Blueprint("auth", __name__, url_prefix="/auth")
 
-# ---- Utilidad: detectar la clase de usuario sin importar el nombre ----
-def _get_user_model():
-    """
-    Busca en todos los modelos (subclases de db.Model) uno que tenga:
-      - username
-      - y (password_hash o password)
-    Opcional: role
-    """
-    # Importa todos los modelos para que las clases estén registradas
+# ------------ utilidades de autodetección ------------
+# nombres posibles de campos
+USER_FIELD_CANDIDATES = ["username", "user", "usuario", "login"]
+PASS_FIELD_CANDIDATES = ["password_hash", "password", "passhash", "pass", "pwd", "clave", "contrasena", "contraseña"]
+ROLE_FIELD_CANDIDATES = ["role", "rol", "perfil"]
+
+def _load_models():
     try:
         import models  # noqa: F401
     except Exception:
+        # si models tiene errores, igual seguimos y probamos con lo registrado en SQLAlchemy
         pass
 
-    # Algunas apps registran modelos en _decl_class_registry (SQLAlchemy clásico)
-    registries = []
+def _iter_model_classes():
+    # clases registradas por SQLAlchemy
+    seen = set()
     if hasattr(db.Model, "_decl_class_registry"):
-        registries.append(getattr(db.Model, "_decl_class_registry"))
-
-    # Y otras vía __subclasses__()
-    subclasses = list(db.Model.__subclasses__())
-
-    # Construir lista única de clases candidatas
-    candidates = set()
-    for reg in registries:
-        for k, v in reg.items():
+        for k, v in db.Model._decl_class_registry.items():
             if isinstance(v, type) and issubclass(v, db.Model):
-                candidates.add(v)
-    for cls in subclasses:
-        candidates.add(cls)
+                if v not in seen:
+                    seen.add(v); yield v
+    # subclasses también
+    for cls in list(db.Model.__subclasses__()):
+        if cls not in seen:
+            seen.add(cls); yield cls
+
+def _attrs(obj):
+    try:
+        return set(dir(obj))
+    except Exception:
+        return set()
+
+def _pick_attr(obj, candidates):
+    a = _attrs(obj)
+    for name in candidates:
+        if name in a:
+            return name
+    return None
+
+def _get_user_model_and_fields():
+    _load_models()
 
     best = None
     best_score = -1
-    for cls in candidates:
-        attrs = dir(cls)
-        has_user = any(a == "username" for a in attrs)
-        has_pass = any(a in ("password_hash", "password") for a in attrs)
-        score = 0
-        if has_user: score += 2
-        if has_pass: score += 2
-        if any(a == "role" for a in attrs): score += 1
-        if score > best_score and (has_user and has_pass):
-            best, best_score = cls, score
+    best_fields = {}
+
+    for cls in _iter_model_classes():
+        attrs = _attrs(cls)
+        u = _pick_attr(cls, USER_FIELD_CANDIDATES)
+        p = _pick_attr(cls, PASS_FIELD_CANDIDATES)
+        r = _pick_attr(cls, ROLE_FIELD_CANDIDATES)
+        score = (2 if u else 0) + (2 if p else 0) + (1 if r else 0)
+        if score > best_score and (u and p):
+            best = cls
+            best_score = score
+            best_fields = {"user": u, "pass": p, "role": r}
 
     if not best:
-        raise RuntimeError(
-            "No se encontró un modelo de usuario: necesito una clase db.Model con "
-            "atributos 'username' y 'password_hash' (o 'password')."
-        )
-    return best
+        return None, None
 
-def _password_get(u):
-    return getattr(u, "password_hash", None) or getattr(u, "password", None)
+    return best, best_fields
 
-# ----------------------- RUTAS -----------------------
+def _hash_password(raw: str):
+    return generate_password_hash(raw)
 
+def _check_password(hashed_or_raw, raw):
+    # si el campo guardado ya está hasheado, check_password_hash funciona
+    try:
+        return check_password_hash(hashed_or_raw, raw)
+    except Exception:
+        # si no está hasheado, comparamos directo (no recomendado, pero evita 500 en entornos de prueba)
+        return hashed_or_raw == raw
+
+# ---------------- diagnóstico ----------------
 @bp.get("/_diagnose")
 def _diagnose():
-    """Lista subclases de db.Model con sus atributos principales (solo lectura)."""
-    from app import db
-    try:
-        import models  # asegura que se importen las clases
-    except Exception as e:
-        return jsonify({"error":"import models failed", "detail": str(e)}), 500
-
+    _load_models()
     out = []
-    # clases registradas por SQLAlchemy (compat)
-    regs = []
-    if hasattr(db.Model, "_decl_class_registry"):
-        regs.append(getattr(db.Model, "_decl_class_registry"))
-    subs = list(db.Model.__subclasses__())
-
-    seen = set()
-    def attrs_of(cls):
-        try:
-            return sorted([a for a in dir(cls) if not a.startswith("_")][:50])
-        except Exception:
-            return []
-
-    for reg in regs:
-        for k,v in reg.items():
-            if isinstance(v, type) and issubclass(v, db.Model) and v not in seen:
-                seen.add(v); out.append({"class": v.__name__, "attrs": attrs_of(v)})
-    for cls in subs:
-        if cls not in seen:
-            seen.add(cls); out.append({"class": cls.__name__, "attrs": attrs_of(cls)})
+    for cls in _iter_model_classes():
+        out.append({
+            "class": cls.__name__,
+            "attrs": sorted([a for a in _attrs(cls) if not a.startswith("_")])[:80]
+        })
     return jsonify({"models": out})
 
-
+# ---------------- rutas ----------------
 @bp.post("/bootstrap-admin")
 def bootstrap_admin():
     key = request.headers.get("X-Bootstrap-Key")
     if not key or key != os.getenv("BOOTSTRAP_ADMIN_KEY"):
         return jsonify({"error": "unauthorized"}), 401
 
-    User = _get_user_model()
-
-    # ¿ya hay admin?
-    q = db.session.query(User)
-    exists = None
-    if hasattr(User, "role"):
-        exists = q.filter(getattr(User, "role") == "admin").first()
-    else:
-        exists = None
-
-    if exists:
-        return jsonify({"error": "admin already exists"}), 409
+    User, f = _get_user_model_and_fields()
+    if not User:
+        return jsonify({
+            "error": "user_model_not_found",
+            "hint": "No encontré una clase db.Model con campos tipo username + password.",
+            "try": "/auth/_diagnose para ver clases y atributos"
+        }), 400
 
     data = request.get_json(force=True) or {}
     username = (data.get("username") or "").strip().lower()
@@ -121,40 +113,53 @@ def bootstrap_admin():
     if not username or not password:
         return jsonify({"error": "username/password requeridos"}), 400
 
+    # ¿ya existe admin?
+    q = db.session.query(User)
+    if f.get("role"):
+        exists = q.filter(getattr(User, f["role"]) == "admin").first()
+        if exists:
+            return jsonify({"error": "admin already exists"}), 409
+
+    # crear admin
     u = User()
-    if hasattr(u, "username"): u.username = username
-    if hasattr(u, "password_hash"):
-        u.password_hash = generate_password_hash(password)
-    elif hasattr(u, "password"):
-        u.password = generate_password_hash(password)
-    if hasattr(u, "role"): u.role = "admin"
+    setattr(u, f["user"], username)
+    # escribir hash siempre (aunque el campo se llame "password")
+    setattr(u, f["pass"], _hash_password(password))
+    if f.get("role"):
+        setattr(u, f["role"], "admin")
 
     db.session.add(u)
     db.session.commit()
 
     tok = create_access_token(
-        identity={"u": getattr(u, "username", username), "r": getattr(u, "role", "admin")},
+        identity={"u": username, "r": "admin"},
         expires_delta=timedelta(hours=12),
     )
     return jsonify({"ok": True, "access_token": tok})
 
 @bp.post("/login")
 def login():
-    User = _get_user_model()
+    User, f = _get_user_model_and_fields()
+    if not User:
+        return jsonify({"error": "user_model_not_found", "try": "/auth/_diagnose"}), 400
+
     data = request.get_json(force=True) or {}
     username = (data.get("username") or "").strip().lower()
     pwd = data.get("password") or ""
+    if not username or not pwd:
+        return jsonify({"error": "username/password requeridos"}), 400
 
-    u = db.session.query(User).filter(getattr(User, "username") == username).first()
+    u = db.session.query(User).filter(getattr(User, f["user"]) == username).first()
     if not u:
         return jsonify({"error": "credenciales inválidas"}), 401
 
-    ph = _password_get(u)
-    if not ph or not check_password_hash(ph, pwd):
+    stored = getattr(u, f["pass"])
+    if not _check_password(stored, pwd):
         return jsonify({"error": "credenciales inválidas"}), 401
 
+    role = getattr(u, f["role"]) if f.get("role") else "client"
     tok = create_access_token(
-        identity={"u": getattr(u, "username", username), "r": getattr(u, "role", "client")},
+        identity={"u": username, "r": role},
         expires_delta=timedelta(hours=12),
     )
     return jsonify({"access_token": tok})
@@ -162,10 +167,14 @@ def login():
 @bp.post("/admin/create-user")
 @jwt_required()
 def admin_create_user():
-    User = _get_user_model()
+    User, f = _get_user_model_and_fields()
+    if not User:
+        return jsonify({"error": "user_model_not_found", "try": "/auth/_diagnose"}), 400
+
     ident = get_jwt_identity() or {}
-    me = db.session.query(User).filter(getattr(User, "username") == ident.get("u", "")).first()
-    if not me or not (getattr(me, "role", None) in ("admin", "superadmin")):
+    me = db.session.query(User).filter(getattr(User, f["user"]) == ident.get("u", "")).first()
+    me_role = getattr(me, f["role"], None) if me and f.get("role") else None
+    if not me or me_role not in ("admin", "superadmin"):
         return jsonify({"error": "admin only"}), 403
 
     data = request.get_json(force=True) or {}
@@ -176,25 +185,23 @@ def admin_create_user():
 
     if not username or not pwd:
         return jsonify({"error": "username/password requeridos"}), 400
-    if db.session.query(User).filter(getattr(User, "username") == username).first():
+
+    if db.session.query(User).filter(getattr(User, f["user"]) == username).first():
         return jsonify({"error": "usuario ya existe"}), 409
 
     u = User()
-    if hasattr(u, "username"): u.username = username
-    if hasattr(u, "password_hash"):
-        u.password_hash = generate_password_hash(pwd)
-    elif hasattr(u, "password"):
-        u.password = generate_password_hash(pwd)
-    if hasattr(u, "role"):
-        u.role = role if role in ("admin", "tester", "client") else "client"
+    setattr(u, f["user"], username)
+    setattr(u, f["pass"], _hash_password(pwd))
+    if f.get("role"):
+        setattr(u, f["role"], role if role in ("admin", "tester", "client") else "client")
 
     if parent_username:
-        p = db.session.query(User).filter(getattr(User, "username") == parent_username).first()
+        p = db.session.query(User).filter(getattr(User, f["user"]) == parent_username).first()
         if p:
             pid = getattr(p, "id", None)
-            for f in ("parent_id", "owner_id", "account_id", "company_id", "creator_id"):
-                if hasattr(u, f) and pid is not None:
-                    setattr(u, f, pid)
+            for rel in ("parent_id", "owner_id", "account_id", "company_id", "creator_id"):
+                if hasattr(u, rel) and pid is not None:
+                    setattr(u, rel, pid)
                     break
 
     db.session.add(u)
