@@ -47,3 +47,6 @@ def seed_plantillas(db):
     ]
     db.session.add_all(items)
     db.session.commit()
+
+# Alias para auth
+User = Usuario
