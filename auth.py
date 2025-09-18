@@ -63,6 +63,39 @@ def _password_get(u):
 
 # ----------------------- RUTAS -----------------------
 
+@bp.get("/_diagnose")
+def _diagnose():
+    """Lista subclases de db.Model con sus atributos principales (solo lectura)."""
+    from app import db
+    try:
+        import models  # asegura que se importen las clases
+    except Exception as e:
+        return jsonify({"error":"import models failed", "detail": str(e)}), 500
+
+    out = []
+    # clases registradas por SQLAlchemy (compat)
+    regs = []
+    if hasattr(db.Model, "_decl_class_registry"):
+        regs.append(getattr(db.Model, "_decl_class_registry"))
+    subs = list(db.Model.__subclasses__())
+
+    seen = set()
+    def attrs_of(cls):
+        try:
+            return sorted([a for a in dir(cls) if not a.startswith("_")][:50])
+        except Exception:
+            return []
+
+    for reg in regs:
+        for k,v in reg.items():
+            if isinstance(v, type) and issubclass(v, db.Model) and v not in seen:
+                seen.add(v); out.append({"class": v.__name__, "attrs": attrs_of(v)})
+    for cls in subs:
+        if cls not in seen:
+            seen.add(cls); out.append({"class": cls.__name__, "attrs": attrs_of(cls)})
+    return jsonify({"models": out})
+
+
 @bp.post("/bootstrap-admin")
 def bootstrap_admin():
     key = request.headers.get("X-Bootstrap-Key")
