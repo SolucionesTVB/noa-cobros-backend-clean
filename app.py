@@ -2,17 +2,26 @@ from flask import Flask, jsonify
 from flask_sqlalchemy import SQLAlchemy
 import os
 
-# Instancia global para que models pueda hacer: from app import db
+# instancia global (para from app import db)
 db = SQLAlchemy()
+
+def _normalize_db_url(raw: str) -> str:
+    if not raw:
+        return "sqlite:///local.db"
+    # Render suele dar 'postgres://...' o 'postgresql://...'
+    if raw.startswith("postgres://"):
+        return raw.replace("postgres://", "postgresql+psycopg://", 1)
+    if raw.startswith("postgresql://") and "+psycopg" not in raw:
+        return raw.replace("postgresql://", "postgresql+psycopg://", 1)
+    return raw
 
 def create_app():
     app = Flask(__name__)
 
-    # DB (Render usa DATABASE_URL). Local: SQLite.
-    app.config["SQLALCHEMY_DATABASE_URI"] = os.getenv("DATABASE_URL", "sqlite:///local.db")
+    # --- DB ---
+    url = _normalize_db_url(os.getenv("DATABASE_URL", "sqlite:///local.db"))
+    app.config["SQLALCHEMY_DATABASE_URI"] = url
     app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
-
-    # Inicializa SQLAlchemy con la app
     db.init_app(app)
 
     @app.get("/health")
@@ -30,5 +39,5 @@ def create_app():
 
     return app
 
-# Necesario para gunicorn "app:app"
+# necesario para gunicorn: "app:app"
 app = create_app()
