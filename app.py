@@ -19,6 +19,33 @@ def create_app():
     app = Flask(__name__)
 
     # --- DB ---
+    url = _normalize_db_url(os.getenv("DATABASE_URL", 
+"sqlite:///local.db"))
+    app.config["SQLALCHEMY_DATABASE_URI"] = url
+    app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+    db.init_app(app)
+
+    # >>> CREA TABLAS SI NO EXISTEN <<<
+    with app.app_context():
+        db.create_all()
+
+    @app.get("/health")
+    def health():
+        return jsonify(ok=True)
+
+    # --- Auth/JWT ---
+    from flask_jwt_extended import JWTManager
+    app.config["JWT_SECRET_KEY"] = os.getenv("JWT_SECRET_KEY", 
+"noa_jwt_2025_super")
+    JWTManager(app)
+
+    from auth import bp as auth_bp
+    app.register_blueprint(auth_bp)
+
+    return app
+
+
+    # --- DB ---
     url = _normalize_db_url(os.getenv("DATABASE_URL", "sqlite:///local.db"))
     app.config["SQLALCHEMY_DATABASE_URI"] = url
     app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
