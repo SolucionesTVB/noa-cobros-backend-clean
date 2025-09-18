@@ -1,6 +1,47 @@
+ 
+hasattr(User, "role") else None
+    if exists:
+        return jsonify({"error": "admin already exists"}), 409
+
+    data = request.get_json(force=True) or {}
+    username = (data.get("username") or "").strip().lower()
+    password = data.get("password") or ""
+    if not username or not password:
+        return jsonify({"error": "username/password requeridos"}), 400
+
+    u = User()
+    if hasattr(u, "username"):
+        u.username = username
+    if hasattr(u, "password_hash"):
+        u.password_hash = generate_password_hash(password)
+    elif hasattr(u, "password"):
+        u.password = generate_password_hash(password)
+    if hasattr(u, "role"):
+        u.role = "admin"
+
+   
+    parent_username = (data.get("parent_username") or "").strip().lower()
+
+    if not username or not pwd:
+        return jsonify({"error": "username/password requeridos"}), 400
+    if db.session.query(User).filter(getattr(User, "username") == 
+username).first():
+        return jsonify({"error": "usuario ya existe"}), 409
+
+    u = User()
+    if hasattr(u, "username"):
+        u.username = username
+    if hasattr(u, "password_hash"):
+        u.password_hash = generate_password_hash(pwd)
+    elif hasattr(u, "password"):
+        u.password = generate_password_hash(pwd)
+    if hasattr(u, "role"):
+        u.role = role if role in ("admin", "tester", "client") else 
+"client"
+
 from flask import Blueprint, request, jsonify
 from werkzeug.security import generate_password_hash, check_password_hash
-from flask_jwt_extended import create_access_token, jwt_required, get_jwt_identity
+from flask_jwt_extended import create_access_token, jwt_required, 
 get_jwt_identity
 from datetime import timedelta
 from app import db
@@ -41,8 +82,8 @@ hasattr(User, "role") else None
     db.session.commit()
 
     tok = create_access_token(
-        identity={"u": getattr(u, "username", username), "r": getattr(u, 
-"role", "admin")},
+        identity={"u": getattr(u, "username", username), "r": getattr(u, "role", 
+"admin")},
         expires_delta=timedelta(hours=12),
     )
     return jsonify({"ok": True, "access_token": tok})
@@ -63,8 +104,8 @@ username).first()
         return jsonify({"error": "credenciales inválidas"}), 401
 
     tok = create_access_token(
-        identity={"u": getattr(u, "username", username), "r": getattr(u, 
-"role", "client")},
+        identity={"u": getattr(u, "username", username), "r": getattr(u, "role", 
+"client")},
         expires_delta=timedelta(hours=12),
     )
     return jsonify({"access_token": tok})
@@ -75,8 +116,7 @@ def admin_create_user():
     ident = get_jwt_identity() or {}
     me = db.session.query(User).filter(getattr(User, "username") == 
 ident.get("u", "")).first()
-    if not me or not (getattr(me, "role", None) in ("admin", 
-"superadmin")):
+    if not me or not (getattr(me, "role", None) in ("admin", "superadmin")):
         return jsonify({"error": "admin only"}), 403
 
     data = request.get_json(force=True) or {}
@@ -99,8 +139,7 @@ username).first():
     elif hasattr(u, "password"):
         u.password = generate_password_hash(pwd)
     if hasattr(u, "role"):
-        u.role = role if role in ("admin", "tester", "client") else 
-"client"
+        u.role = role if role in ("admin", "tester", "client") else "client"
 
     if parent_username:
         p = db.session.query(User).filter(getattr(User, "username") == 
