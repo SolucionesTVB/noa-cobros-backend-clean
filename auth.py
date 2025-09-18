@@ -1,44 +1,3 @@
- 
-hasattr(User, "role") else None
-    if exists:
-        return jsonify({"error": "admin already exists"}), 409
-
-    data = request.get_json(force=True) or {}
-    username = (data.get("username") or "").strip().lower()
-    password = data.get("password") or ""
-    if not username or not password:
-        return jsonify({"error": "username/password requeridos"}), 400
-
-    u = User()
-    if hasattr(u, "username"):
-        u.username = username
-    if hasattr(u, "password_hash"):
-        u.password_hash = generate_password_hash(password)
-    elif hasattr(u, "password"):
-        u.password = generate_password_hash(password)
-    if hasattr(u, "role"):
-        u.role = "admin"
-
-   
-    parent_username = (data.get("parent_username") or "").strip().lower()
-
-    if not username or not pwd:
-        return jsonify({"error": "username/password requeridos"}), 400
-    if db.session.query(User).filter(getattr(User, "username") == 
-username).first():
-        return jsonify({"error": "usuario ya existe"}), 409
-
-    u = User()
-    if hasattr(u, "username"):
-        u.username = username
-    if hasattr(u, "password_hash"):
-        u.password_hash = generate_password_hash(pwd)
-    elif hasattr(u, "password"):
-        u.password = generate_password_hash(pwd)
-    if hasattr(u, "role"):
-        u.role = role if role in ("admin", "tester", "client") else 
-"client"
-
 from flask import Blueprint, request, jsonify
 from werkzeug.security import generate_password_hash, check_password_hash
 from flask_jwt_extended import create_access_token, jwt_required, 
@@ -155,5 +114,4 @@ parent_username).first()
     db.session.add(u)
     db.session.commit()
     return jsonify({"ok": True})
-
 
