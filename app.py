@@ -1,6 +1,6 @@
 from flask import Flask, jsonify
 from flask_sqlalchemy import SQLAlchemy
-import os
+import os, traceback, sys
 
 # instancia global (para "from app import db")
 db = SQLAlchemy()
@@ -17,6 +17,7 @@ def _normalize_db_url(raw: str) -> str:
 
 def create_app():
     app = Flask(__name__)
+    app.config["PROPAGATE_EXCEPTIONS"] = True
 
     # --- DB ---
     url = _normalize_db_url(os.getenv("DATABASE_URL", "sqlite:///local.db"))
@@ -24,10 +25,18 @@ def create_app():
     app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
     db.init_app(app)
 
-    # Importar modelos y crear tablas (import models ANTES de create_all)
+    # Importar modelos y crear tablas
     with app.app_context():
-        import models  # registra clases para que create_all sepa qué tablas crear
+        import models  # registra clases
         db.create_all()
+
+    @app.errorhandler(Exception)
+    def _app_error(e):
+        tb = traceback.format_exc()
+        print("=== APP ERROR ===", file=sys.stderr)
+        print(tb, file=sys.stderr)
+        # Devolver JSON con detalle en vez de HTML
+        return jsonify({"error":"exception","detail":str(e)}), 500
 
     @app.get("/health")
     def health():
@@ -40,6 +49,11 @@ def create_app():
 
     from auth import bp as auth_bp
     app.register_blueprint(auth_bp)
+
+    # ruta sencilla para confirmar que la app vive
+    @app.get("/_echo")
+    def _echo():
+        return jsonify(ok=True, msg="app viva")
 
     return app
 
