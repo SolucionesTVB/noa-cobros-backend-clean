@@ -50,4 +50,23 @@ class OrgMembership(db.Model):
     # Opcional: relaciones si quieres
     # user = db.relationship("User")
     # org  = db.relationship("Organization")
+# --- MULTI-TENANT: organizations + org_memberships ---
+import uuid
+from sqlalchemy import String, DateTime
+from sqlalchemy.sql import func
+
+class Organization(db.Model):
+    __tablename__ = "organizations"
+    id = db.Column(db.String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    name = db.Column(db.String(80), unique=True, nullable=False)
+    status = db.Column(db.String(20), nullable=False, default="active")
+    created_at = db.Column(db.DateTime(timezone=True), server_default=func.now())
+
+class OrgMembership(db.Model):
+    __tablename__ = "org_memberships"
+    id = db.Column(db.String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id = db.Column(db.Integer, db.ForeignKey("users.id", ondelete="CASCADE"), nullable=False)  # ajusta tipo si tu users.id no es Integer
+    org_id  = db.Column(db.String(36), db.ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False)
+    role    = db.Column(db.String(20), nullable=False)  # owner/manager/agent/viewer/suspended
+    created_at = db.Column(db.DateTime(timezone=True), server_default=func.now())
 
