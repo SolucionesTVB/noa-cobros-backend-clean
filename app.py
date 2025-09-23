@@ -1,8 +1,7 @@
 from flask import Flask, jsonify
 from flask_sqlalchemy import SQLAlchemy
 import os, traceback, sys
-from seed_startup import seed_startup
-from org_routes import register_org_routes
+
 
 # instancia global (para "from app import db")
 db = SQLAlchemy()
@@ -32,6 +31,23 @@ register_org_routes(app)
     # --- DB ---
     url = _normalize_db_url(os.getenv("DATABASE_URL", "sqlite:///local.db"))
     app.config["SQLALCHEMY_DATABASE_URI"] = url
+# ⬇️ IMPORTAR DESPUÉS de crear app y db
+from seed_startup import seed_startup
+from org_routes import register_org_routes
+
+# Seed al arrancar
+@app.before_first_request
+def _seed():
+    seed_startup()
+
+# Registrar rutas /orgs
+register_org_routes(app)
+
+# Health (por si no existe)
+@app.route("/health")
+def health():
+    return {"ok": True}
+
     app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
     db.init_app(app)
 
