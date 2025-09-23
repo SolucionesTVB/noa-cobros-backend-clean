@@ -18,6 +18,9 @@ def _normalize_db_url(raw: str) -> str:
 
 def create_app():
     app = Flask(__name__)
+    import noa_multitenant_plugin as NOA
+NOA.init(app)
+
     # seed al arrancar (crea/actualiza tony/jeff/hermann)
 @app.before_first_request
 def _seed():
