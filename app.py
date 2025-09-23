@@ -1,6 +1,8 @@
 from flask import Flask, jsonify
 from flask_sqlalchemy import SQLAlchemy
 import os, traceback, sys
+from seed_startup import seed_startup
+from org_routes import register_org_routes
 
 # instancia global (para "from app import db")
 db = SQLAlchemy()
@@ -17,6 +19,14 @@ def _normalize_db_url(raw: str) -> str:
 
 def create_app():
     app = Flask(__name__)
+    # seed al arrancar (crea/actualiza tony/jeff/hermann)
+@app.before_first_request
+def _seed():
+    seed_startup()
+
+# registrar las rutas /orgs
+register_org_routes(app)
+
     app.config["PROPAGATE_EXCEPTIONS"] = True
 
     # --- DB ---
