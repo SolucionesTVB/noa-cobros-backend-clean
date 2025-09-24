@@ -1,130 +1,90 @@
-from flask import Flask, jsonify
+import os
+from flask import Flask, jsonify, request
 from flask_sqlalchemy import SQLAlchemy
-import os, traceback, sys
+from flask_cors import CORS
+from sqlalchemy import text
 
-
-# instancia global (para "from app import db")
 db = SQLAlchemy()
 
 def _normalize_db_url(raw: str) -> str:
     if not raw:
         return "sqlite:///local.db"
-    # Render suele dar 'postgres://...' o 'postgresql://...'
     if raw.startswith("postgres://"):
         return raw.replace("postgres://", "postgresql+psycopg://", 1)
     if raw.startswith("postgresql://") and "+psycopg" not in raw:
         return raw.replace("postgresql://", "postgresql+psycopg://", 1)
     return raw
 
-def create_app():
-    app = Flask(__name__)
-    import noa_multitenant_plugin as NOA
-NOA.init(app)
+app = Flask(__name__)
+CORS(app)
 
-    # seed al arrancar (crea/actualiza tony/jeff/hermann)
-@app.before_first_request
-def _seed():
-    seed_startup()
+url = _normalize_db_url(os.getenv("DATABASE_URL", "sqlite:///local.db"))
+app.config["SQLALCHEMY_DATABASE_URI"] = url
+app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+db.init_app(app)
 
-# registrar las rutas /orgs
-register_org_routes(app)
-app.config["PROPAGATE_EXCEPTIONS"] = True
+class User(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    email = db.Column(db.String(255), unique=True, nullable=False)
 
-    # --- DB ---
-    url = _normalize_db_url(os.getenv("DATABASE_URL", "sqlite:///local.db"))
-    app.config["SQLALCHEMY_DATABASE_URI"] = url
-# ⬇️ IMPORTAR DESPUÉS de crear app y db
-from seed_startup import seed_startup
-from org_routes import register_org_routes
-
-# Seed al arrancar
-@app.before_first_request
-def _seed():
-    seed_startup()
-
-# Registrar rutas /orgs
-register_org_routes(app)
-
-# Health (por si no existe)
-@app.route("/health")
-def health():
-    return {"ok": True}
-
-    app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
-    db.init_app(app)
-
-    # Importar modelos y crear tablas
-    with app.app_context():
-        import models  # registra clases
+with app.app_context():
+    try:
         db.create_all()
+    except Exception:
+        pass
 
-    @app.errorhandler(Exception)
-    def _app_error(e):
-        tb = traceback.format_exc()
-        print("=== APP ERROR ===", file=sys.stderr)
-        print(tb, file=sys.stderr)
-        # Devolver JSON con detalle en vez de HTML
-        return jsonify({"error":"exception","detail":str(e)}), 500
+@app.get("/health")
+def health():
+    ok_db = False
+    err = None
+    try:
+        db.session.execute(text("SELECT 1"))
+        ok_db = True
+    except Exception as e:
+        err = str(e)
+    return jsonify({
+        "ok": ok_db,
+        "db": "on" if ok_db else "off",
+        "status": "healthy" if ok_db else "degraded",
+        "db_url_scheme": url.split(":")[0] if ":" in url else url,
+        "error": err
+    }), 200
 
-    @app.get("/health")
-    def health():
-        return jsonify(ok=True)
+@app.post("/auth/login")
+def login():
+    data = request.get_json(silent=True) or {}
+    email = (data.get("email") or "").strip()
+    password = (data.get("password") or "").strip()
 
-    # --- Auth/JWT ---
-    from flask_jwt_extended import JWTManager
-    app.config["JWT_SECRET_KEY"] = os.getenv("JWT_SECRET_KEY", "noa_jwt_2025_super")
-    JWTManager(app)
+    demo_email = os.getenv("DEMO_EMAIL")
+    demo_pass = os.getenv("DEMO_PASSWORD")
+    if demo_email is not None and demo_pass is not None:
+        if email != demo_email or password != demo_pass:
+            return jsonify({"error": "credenciales inválidas"}), 401
 
-    from auth import bp as auth_bp
-    app.register_blueprint(auth_bp)
+    if not email or not password:
+        return jsonify({"error": "faltan campos"}), 400
 
-    # ruta sencilla para confirmar que la app vive
-    @app.get("/_echo")
-    def _echo():
-        return jsonify(ok=True, msg="app viva")
+    return jsonify({"access_token": "demo-token", "token_type": "bearer"}), 200
 
-    return app
+def _require_token():
+    auth = request.headers.get("Authorization", "")
+    return auth.strip() == "Bearer demo-token"
 
-# necesario para gunicorn: "app:app"
-app = create_app()
-# === NOA: inicialización segura (no revienta el deploy si algo falla) ===
-try:
-    import noa_multitenant_plugin as NOA
-    NOA.init(app)
-    print("[NOA] init OK")
-except Exception as e:
-    import traceback
-    print("[NOA] init ERROR:", e)
-    traceback.print_exc()
+@app.get("/users")
+def list_users():
+    if not _require_token():
+        return jsonify({"error": "no autorizado"}), 401
+    try:
+        users = User.query.limit(10).all()
+        if not users:
+            return jsonify([{"id": 1, "email": "demo@noa.com"}]), 200
+        return jsonify([{"id": u.id, "email": u.email} for u in users]), 200
+    except Exception as e:
+        return jsonify({"error": "db_error", "detail": str(e)}), 500
 
-# Health por si aún no existe
-try:
-    @app.route("/health")
-    def _health():
-        return {"ok": True}
-except Exception:
-    pass
-# === NOA: inicialización segura (no tumba el deploy si algo falla) ===
-try:
-    import noa_multitenant_plugin as NOA
-    NOA.init(app)
-    print("[NOA] init OK")
-except Exception as e:
-    import traceback
-    print("[NOA] init ERROR:", e)
-    traceback.print_exc()
-
-# Health por si no existe
-try:
-    @app.route("/health")
-    def _health():
-        return {"ok": True}
-except Exception:
-    pass
-    from simple_auth import register_auth, decode_access
-register_auth(app)
-
-import noa_multitenant_plugin as NOA
-NOA.init(app)
-
-
+@app.get("/cobros")
+def list_cobros():
+    if not _require_token():
+        return jsonify({"error": "no autorizado"}), 401
+    return jsonify([]), 200
