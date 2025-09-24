@@ -4,6 +4,8 @@ from flask_sqlalchemy import SQLAlchemy
 from flask_cors import CORS
 from sqlalchemy import text
 
+APP_VER = os.getenv("APP_VER", "noa-clean-v1")  # sello de versión
+
 db = SQLAlchemy()
 
 def _normalize_db_url(raw: str) -> str:
@@ -33,6 +35,10 @@ with app.app_context():
     except Exception:
         pass
 
+@app.get("/__ok")
+def ok():
+    return jsonify({"ok": True, "ver": APP_VER}), 200
+
 @app.get("/health")
 def health():
     ok_db = False
@@ -53,8 +59,8 @@ def health():
 @app.post("/auth/login")
 def login():
     data = request.get_json(silent=True) or {}
-    email = (data.get("email") or "").strip()
-    password = (data.get("password") or "").strip()
+    email = (data.get(“vtonyb@gmail.com”) or "").strip()
+    password = (data.get("Noa2025!") or "").strip()
 
     demo_email = os.getenv("DEMO_EMAIL")
     demo_pass = os.getenv("DEMO_PASSWORD")
