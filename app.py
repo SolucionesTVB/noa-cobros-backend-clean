@@ -1,4 +1,4 @@
-import os, datetime
+import os, datetime, io, csv
 from flask import Flask, jsonify, request, make_response
 from flask_sqlalchemy import SQLAlchemy
 from flask_cors import CORS
@@ -18,8 +18,8 @@ def _normalize_db_url(raw: str) -> str:
 
 app = Flask(__name__)
 
-# === CORS: solo frontend permitido, docs públicos ===
-FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "*")  # p.ej. https://tu-sitio.netlify.app
+# === CORS: solo tu frontend, docs públicos ===
+FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "*")  # p.ej. https://polite-gumdrop-ba6be7.netlify.app
 CORS(app, resources={
     r"/docs": {"origins": "*"},
     r"/openapi.json": {"origins": "*"},
@@ -81,7 +81,6 @@ def _require_user():
         return None, (jsonify({"error": "no_autorizado"}), 401)
     return user, None
 
-# Seguridad extra: si FRONTEND_ORIGIN no es "*", solo ese Origin puede pegarle a /auth, /users, /cobros
 @app.before_request
 def _strict_origin():
     if FRONTEND_ORIGIN == "*" or request.method == "OPTIONS":
@@ -153,14 +152,6 @@ def login():
     token = _make_token(u.id, u.email)
     return jsonify({"access_token": token, "token_type": "bearer"}), 200
 
-# ===== USERS =====
-@app.get("/users")
-def list_users():
-    user, err = _require_user()
-    if err: return err
-    users = User.query.order_by(User.id.asc()).limit(50).all()
-    return jsonify([{"id": u.id, "email": u.email} for u in users]), 200
-
 # ===== COBROS =====
 def _parse_int(value, default):
     try:
@@ -169,17 +160,41 @@ def _parse_int(value, default):
     except Exception:
         return default
 
+def _parse_date(s):
+    """YYYY-MM-DD -> datetime (inicio del día). Si vacío o mal, devuelve None."""
+    if not s:
+        return None
+    try:
+        return datetime.datetime.strptime(s, "%Y-%m-%d")
+    except Exception:
+        return None
+
 @app.get("/cobros")
 def get_cobros():
     user, err = _require_user()
     if err: return err
+
+    # Filtros básicos
     estado = request.args.get("estado", "", type=str).strip().lower()
+    desde_str = request.args.get("desde", "", type=str).strip()
+    hasta_str = request.args.get("hasta", "", type=str).strip()
     page = _parse_int(request.args.get("page", 1), 1)
     page_size = _parse_int(request.args.get("page_size", 20), 20)
     if page_size > 100: page_size = 100
+
     q = Cobro.query
     if estado in ("pendiente", "pagado", "cancelado"):
         q = q.filter(Cobro.estado == estado)
+
+    # Filtro por fechas (incluye día completo)
+    d_desde = _parse_date(desde_str)
+    d_hasta = _parse_date(hasta_str)
+    if d_desde:
+        q = q.filter(Cobro.creado_en >= d_desde)
+    if d_hasta:
+        fin = d_hasta + datetime.timedelta(days=1) - datetime.timedelta(seconds=1)
+        q = q.filter(Cobro.creado_en <= fin)
+
     total = q.count()
     items = q.order_by(Cobro.id.desc()).offset((page-1)*page_size).limit(page_size).all()
     return jsonify({
@@ -267,11 +282,55 @@ def borrar_cobro(cobro_id: int):
         db.session.rollback()
         return jsonify({"error": "db_error", "detail": str(e)}), 500
 
+# ===== EXPORT CSV =====
+@app.get("/cobros/export.csv")
+def export_cobros_csv():
+    user, err = _require_user()
+    if err: return err
+
+    estado = request.args.get("estado", "", type=str).strip().lower()
+    desde_str = request.args.get("desde", "", type=str).strip()
+    hasta_str = request.args.get("hasta", "", type=str).strip()
+
+    q = Cobro.query
+    if estado in ("pendiente", "pagado", "cancelado"):
+        q = q.filter(Cobro.estado == estado)
+
+    d_desde = _parse_date(desde_str)
+    d_hasta = _parse_date(hasta_str)
+    if d_desde:
+        q = q.filter(Cobro.creado_en >= d_desde)
+    if d_hasta:
+        fin = d_hasta + datetime.timedelta(days=1) - datetime.timedelta(seconds=1)
+        q = q.filter(Cobro.creado_en <= fin)
+
+    rows = q.order_by(Cobro.id.desc()).all()
+
+    # Construir CSV en memoria
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(["id", "monto", "descripcion", "referencia", "estado", "creado_en"])
+    for c in rows:
+        w.writerow([
+            c.id,
+            (float(c.monto) if c.monto is not None else 0.0),
+            (c.descripcion or ""),
+            (c.referencia or ""),
+            c.estado,
+            (c.creado_en.isoformat() if c.creado_en else "")
+        ])
+
+    out = make_response(buf.getvalue())
+    out.headers["Content-Type"] = "text/csv; charset=utf-8"
+    fname = f"cobros_{datetime.datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.csv"
+    out.headers["Content-Disposition"] = f'attachment; filename="{fname}"'
+    return out, 200
+
 # ====== OPENAPI (Swagger UI) ======
 def _openapi_spec():
     return {
         "openapi": "3.0.3",
-        "info": {"title": "NOA Cobros API", "version": "1.0.0"},
+        "info": {"title": "NOA Cobros API", "version": "1.1.0"},
         "servers": [{"url": "/"}],
         "paths": {
             "/health": {"get": {"summary": "Health", "responses": {"200": {"description": "OK"}}}},
@@ -282,6 +341,8 @@ def _openapi_spec():
                 "get": {"summary": "Listar cobros","security":[{"bearerAuth":[]}],
                         "parameters":[
                             {"name":"estado","in":"query","schema":{"type":"string","enum":["pendiente","pagado","cancelado"]}},
+                            {"name":"desde","in":"query","schema":{"type":"string","example":"2025-09-01"}},
+                            {"name":"hasta","in":"query","schema":{"type":"string","example":"2025-09-30"}},
                             {"name":"page","in":"query","schema":{"type":"integer","minimum":1}},
                             {"name":"page_size","in":"query","schema":{"type":"integer","minimum":1,"maximum":100}}
                         ],
@@ -296,6 +357,15 @@ def _openapi_spec():
                 "delete":{"summary":"Borrar cobro","security":[{"bearerAuth":[]}],
                           "parameters":[{"name":"id","in":"path","required":True,"schema":{"type":"integer"}}],
                           "responses":{"200":{"description":"OK"},"404":{"description":"No encontrado"}}}
+            },
+            "/cobros/export.csv": {
+                "get": {"summary":"Exportar cobros a CSV","security":[{"bearerAuth":[]}],
+                        "parameters":[
+                            {"name":"estado","in":"query","schema":{"type":"string","enum":["pendiente","pagado","cancelado"]}},
+                            {"name":"desde","in":"query","schema":{"type":"string","example":"2025-09-01"}},
+                            {"name":"hasta","in":"query","schema":{"type":"string","example":"2025-09-30"}}
+                        ],
+                        "responses":{"200":{"description":"CSV"}}}
             }
         },
         "components": {"securitySchemes": {"bearerAuth": {"type": "http", "scheme": "bearer", "bearerFormat": "JWT"}}}
