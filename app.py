@@ -30,7 +30,7 @@ class User(db.Model):
 
 class Cobro(db.Model):
     id = db.Column(db.Integer, primary_key=True)
-    monto = db.Column(db.Float, nullable=False)  # Float para evitar líos con Numeric + psycopg
+    monto = db.Column(db.Float, nullable=False)
     descripcion = db.Column(db.String(255))
     estado = db.Column(db.String(20), nullable=False, default="pendiente")  # pendiente|pagado|cancelado
     creado_en = db.Column(db.DateTime, server_default=db.func.now())
@@ -139,6 +139,60 @@ def crear_cobro():
             "estado": nuevo.estado,
             "creado_en": nuevo.creado_en.isoformat() if nuevo.creado_en else None
         }), 201
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": "db_error", "detail": str(e)}), 500
+
+@app.patch("/cobros/<int:cobro_id>")
+def actualizar_cobro(cobro_id: int):
+    if not _require_token():
+        return jsonify({"error": "no autorizado"}), 401
+    data = request.get_json(silent=True) or {}
+    # Solo permitimos cambiar 'estado' y opcionalmente 'descripcion'
+    estado = data.get("estado")
+    descripcion = data.get("descripcion")
+
+    if estado is None and descripcion is None:
+        return jsonify({"error": "nada_para_actualizar"}), 400
+
+    if estado is not None:
+        estado = str(estado).strip().lower()
+        if estado not in ("pendiente", "pagado", "cancelado"):
+            return jsonify({"error": "estado_invalido"}), 400
+
+    c = Cobro.query.get(cobro_id)
+    if not c:
+        return jsonify({"error": "no_encontrado"}), 404
+
+    try:
+        if estado is not None:
+            c.estado = estado
+        if descripcion is not None:
+            dsc = descripcion.strip()
+            c.descripcion = dsc or None
+        db.session.commit()
+        return jsonify({
+            "id": c.id,
+            "monto": float(c.monto),
+            "descripcion": c.descripcion,
+            "estado": c.estado,
+            "creado_en": c.creado_en.isoformat() if c.creado_en else None
+        }), 200
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": "db_error", "detail": str(e)}), 500
+
+@app.delete("/cobros/<int:cobro_id>")
+def borrar_cobro(cobro_id: int):
+    if not _require_token():
+        return jsonify({"error": "no autorizado"}), 401
+    c = Cobro.query.get(cobro_id)
+    if not c:
+        return jsonify({"error": "no_encontrado"}), 404
+    try:
+        db.session.delete(c)
+        db.session.commit()
+        return jsonify({"ok": True, "id": cobro_id}), 200  # también podría ser 204 sin body
     except Exception as e:
         db.session.rollback()
         return jsonify({"error": "db_error", "detail": str(e)}), 500
