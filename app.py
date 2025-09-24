@@ -105,4 +105,21 @@ try:
         return {"ok": True}
 except Exception:
     pass
+# === NOA: inicialización segura (no tumba el deploy si algo falla) ===
+try:
+    import noa_multitenant_plugin as NOA
+    NOA.init(app)
+    print("[NOA] init OK")
+except Exception as e:
+    import traceback
+    print("[NOA] init ERROR:", e)
+    traceback.print_exc()
+
+# Health por si no existe
+try:
+    @app.route("/health")
+    def _health():
+        return {"ok": True}
+except Exception:
+    pass
 
