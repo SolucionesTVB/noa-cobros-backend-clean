@@ -92,21 +92,47 @@ def list_users():
         return jsonify({"error": "db_error", "detail": str(e)}), 500
 
 # ===== COBROS =====
+def _parse_int(value, default):
+    try:
+        v = int(value)
+        return v if v > 0 else default
+    except Exception:
+        return default
+
 @app.get("/cobros")
 def get_cobros():
     if not _require_token():
         return jsonify({"error": "no autorizado"}), 401
-    cobros = Cobro.query.order_by(Cobro.id.desc()).all()
-    return jsonify([
-        {
-            "id": c.id,
-            "monto": float(c.monto) if c.monto is not None else 0.0,
-            "descripcion": c.descripcion,
-            "estado": c.estado,
-            "creado_en": c.creado_en.isoformat() if c.creado_en else None
-        }
-        for c in cobros
-    ]), 200
+
+    # Filtros: ?estado=pendiente|pagado|cancelado
+    estado = request.args.get("estado", "", type=str).strip().lower()
+    q = Cobro.query
+    if estado in ("pendiente", "pagado", "cancelado"):
+        q = q.filter(Cobro.estado == estado)
+
+    # Paginación: ?page=1&page_size=20 (defaults)
+    page = _parse_int(request.args.get("page", 1), 1)
+    page_size = _parse_int(request.args.get("page_size", 20), 20)
+    if page_size > 100:
+        page_size = 100  # límite sano
+
+    total = q.count()
+    items = q.order_by(Cobro.id.desc()).offset((page - 1) * page_size).limit(page_size).all()
+
+    return jsonify({
+        "page": page,
+        "page_size": page_size,
+        "total": total,
+        "items": [
+            {
+                "id": c.id,
+                "monto": float(c.monto) if c.monto is not None else 0.0,
+                "descripcion": c.descripcion,
+                "estado": c.estado,
+                "creado_en": c.creado_en.isoformat() if c.creado_en else None
+            } for c in items
+        ]
+    }), 200
 
 @app.post("/cobros")
 def crear_cobro():
@@ -128,7 +154,7 @@ def crear_cobro():
         return jsonify({"error": "estado_invalido"}), 400
 
     try:
-        db.create_all()  # por si la tabla recién se crea
+        db.create_all()
         nuevo = Cobro(monto=monto, descripcion=descripcion, estado=estado)
         db.session.add(nuevo)
         db.session.commit()
@@ -148,7 +174,6 @@ def actualizar_cobro(cobro_id: int):
     if not _require_token():
         return jsonify({"error": "no autorizado"}), 401
     data = request.get_json(silent=True) or {}
-    # Solo permitimos cambiar 'estado' y opcionalmente 'descripcion'
     estado = data.get("estado")
     descripcion = data.get("descripcion")
 
@@ -192,7 +217,7 @@ def borrar_cobro(cobro_id: int):
     try:
         db.session.delete(c)
         db.session.commit()
-        return jsonify({"ok": True, "id": cobro_id}), 200  # también podría ser 204 sin body
+        return jsonify({"ok": True, "id": cobro_id}), 200
     except Exception as e:
         db.session.rollback()
         return jsonify({"error": "db_error", "detail": str(e)}), 500
