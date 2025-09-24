@@ -30,10 +30,9 @@ class User(db.Model):
 
 class Cobro(db.Model):
     id = db.Column(db.Integer, primary_key=True)
-    # 👇 Float para evitar líos con Numeric + psycopg
-    monto = db.Column(db.Float, nullable=False)
+    monto = db.Column(db.Float, nullable=False)  # Float para evitar líos con Numeric + psycopg
     descripcion = db.Column(db.String(255))
-    estado = db.Column(db.String(20), nullable=False, default="pendiente")
+    estado = db.Column(db.String(20), nullable=False, default="pendiente")  # pendiente|pagado|cancelado
     creado_en = db.Column(db.DateTime, server_default=db.func.now())
 
 with app.app_context():
@@ -115,7 +114,7 @@ def crear_cobro():
         return jsonify({"error": "no autorizado"}), 401
     data = request.get_json(silent=True) or {}
 
-    # Validaciones modo 8 años
+    # Validaciones simples
     try:
         monto = float(data.get("monto", 0))
     except Exception:
@@ -129,8 +128,7 @@ def crear_cobro():
         return jsonify({"error": "estado_invalido"}), 400
 
     try:
-        # Asegurar tablas (por si la DB se inicializó recién)
-        db.create_all()
+        db.create_all()  # por si la tabla recién se crea
         nuevo = Cobro(monto=monto, descripcion=descripcion, estado=estado)
         db.session.add(nuevo)
         db.session.commit()
