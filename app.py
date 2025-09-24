@@ -121,4 +121,10 @@ try:
         return {"ok": True}
 except Exception:
     pass
+    from simple_auth import register_auth, decode_access
+register_auth(app)
+
+import noa_multitenant_plugin as NOA
+NOA.init(app)
+
 
