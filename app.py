@@ -28,8 +28,7 @@ def _seed():
 
 # registrar las rutas /orgs
 register_org_routes(app)
-
-    app.config["PROPAGATE_EXCEPTIONS"] = True
+app.config["PROPAGATE_EXCEPTIONS"] = True
 
     # --- DB ---
     url = _normalize_db_url(os.getenv("DATABASE_URL", "sqlite:///local.db"))
