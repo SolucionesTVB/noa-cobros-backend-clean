@@ -88,3 +88,21 @@ def health():
 
 # necesario para gunicorn: "app:app"
 app = create_app()
+# === NOA: inicialización segura (no revienta el deploy si algo falla) ===
+try:
+    import noa_multitenant_plugin as NOA
+    NOA.init(app)
+    print("[NOA] init OK")
+except Exception as e:
+    import traceback
+    print("[NOA] init ERROR:", e)
+    traceback.print_exc()
+
+# Health por si aún no existe
+try:
+    @app.route("/health")
+    def _health():
+        return {"ok": True}
+except Exception:
+    pass
+
