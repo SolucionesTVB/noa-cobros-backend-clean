@@ -48,6 +48,22 @@ with app.app_context():
     except Exception:
         pass
 
+
+# ==== AUTO-MIGRATIONS (Alembic) ====
+if os.getenv("RUN_DB_MIGRATIONS") == "1":
+    try:
+        from alembic.config import Config as _AlbConfig
+        from alembic import command as _alb_command
+        _cfg = _AlbConfig(os.path.join(os.path.dirname(__file__), "alembic.ini"))
+        # Asegurar que Alembic use la misma URL normalizada de la app
+        _cfg.set_main_option("sqlalchemy.url", url)
+        with app.app_context():
+            _alb_command.upgrade(_cfg, "head")
+        print("Alembic auto-migrations: OK (upgrade head)")
+    except Exception as _e:
+        print("Alembic auto-migrations: ERROR ->", _e)
+# ==== FIN AUTO-MIGRATIONS ====
+
 # ==== UTILS AUTH ====
 def _make_token(user_id: int, email: str) -> str:
     now = datetime.datetime.utcnow()
