@@ -17,7 +17,15 @@ def _normalize_db_url(raw: str) -> str:
     return raw
 
 app = Flask(__name__)
-CORS(app)
+
+# === CORS: solo frontend permitido, docs públicos ===
+FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "*")  # p.ej. https://tu-sitio.netlify.app
+CORS(app, resources={
+    r"/docs": {"origins": "*"},
+    r"/openapi.json": {"origins": "*"},
+    r"/health": {"origins": "*"},
+    r"/*": {"origins": FRONTEND_ORIGIN}
+}, supports_credentials=False)
 
 url = _normalize_db_url(os.getenv("DATABASE_URL", "sqlite:///local.db"))
 app.config["SQLALCHEMY_DATABASE_URI"] = url
@@ -39,7 +47,7 @@ class Cobro(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     monto = db.Column(db.Float, nullable=False)
     descripcion = db.Column(db.String(255))
-    referencia = db.Column(db.String(50))  # 👈 NUEVO CAMPO
+    referencia = db.Column(db.String(50))
     estado = db.Column(db.String(20), nullable=False, default="pendiente")  # pendiente|pagado|cancelado
     creado_en = db.Column(db.DateTime, server_default=db.func.now())
 
@@ -49,7 +57,7 @@ with app.app_context():
     except Exception:
         pass
 
-# ===== AUTH UTILS =====
+# ==== UTILS AUTH ====
 def _make_token(user_id: int, email: str) -> str:
     now = datetime.datetime.utcnow()
     payload = {"sub": str(user_id), "email": email, "iat": now, "exp": now + datetime.timedelta(minutes=JWT_EXP_MIN)}
@@ -72,6 +80,19 @@ def _require_user():
     if not user:
         return None, (jsonify({"error": "no_autorizado"}), 401)
     return user, None
+
+# Seguridad extra: si FRONTEND_ORIGIN no es "*", solo ese Origin puede pegarle a /auth, /users, /cobros
+@app.before_request
+def _strict_origin():
+    if FRONTEND_ORIGIN == "*" or request.method == "OPTIONS":
+        return
+    path = request.path or ""
+    publico = path.startswith("/docs") or path.startswith("/openapi.json") or path.startswith("/health")
+    if publico:
+        return
+    origin = request.headers.get("Origin", "")
+    if origin and origin != FRONTEND_ORIGIN:
+        return jsonify({"error": "origin_no_permitido"}), 403
 
 # ===== HEALTH =====
 @app.get("/health")
@@ -208,18 +229,15 @@ def actualizar_cobro(cobro_id: int):
     estado = data.get("estado")
     descripcion = data.get("descripcion")
     referencia = data.get("referencia")
-
     if estado is None and descripcion is None and referencia is None:
         return jsonify({"error": "nada_para_actualizar"}), 400
     if estado is not None:
         estado = str(estado).strip().lower()
         if estado not in ("pendiente", "pagado", "cancelado"):
             return jsonify({"error": "estado_invalido"}), 400
-
     c = Cobro.query.get(cobro_id)
     if not c:
         return jsonify({"error": "no_encontrado"}), 404
-
     try:
         if estado is not None: c.estado = estado
         if descripcion is not None: c.descripcion = (descripcion or "").strip() or None
