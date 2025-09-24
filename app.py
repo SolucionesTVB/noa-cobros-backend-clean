@@ -1,5 +1,5 @@
 import os, datetime
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, make_response
 from flask_sqlalchemy import SQLAlchemy
 from flask_cors import CORS
 from sqlalchemy import text
@@ -16,19 +16,19 @@ def _normalize_db_url(raw: str) -> str:
         return raw.replace("postgresql://", "postgresql+psycopg://", 1)
     return raw
 
-# ==== APP / CONFIG ====
 app = Flask(__name__)
 CORS(app)
+
 url = _normalize_db_url(os.getenv("DATABASE_URL", "sqlite:///local.db"))
 app.config["SQLALCHEMY_DATABASE_URI"] = url
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
-JWT_SECRET = os.getenv("JWT_SECRET", "CÁMBIAME-POR-FAVOR")  # 🔐 PÓN TODO EN RENDER
+JWT_SECRET = os.getenv("JWT_SECRET", "CÁMBIAME-POR-FAVOR")
 JWT_ALG = "HS256"
-JWT_EXP_MIN = int(os.getenv("JWT_EXP_MIN", "1440"))  # 24 horas
+JWT_EXP_MIN = int(os.getenv("JWT_EXP_MIN", "1440"))
 
 db.init_app(app)
 
-# ==== MODELOS ====
+# ===== MODELOS =====
 class User(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     email = db.Column(db.String(255), unique=True, nullable=False, index=True)
@@ -39,6 +39,7 @@ class Cobro(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     monto = db.Column(db.Float, nullable=False)
     descripcion = db.Column(db.String(255))
+    referencia = db.Column(db.String(50))  # 👈 NUEVO CAMPO
     estado = db.Column(db.String(20), nullable=False, default="pendiente")  # pendiente|pagado|cancelado
     creado_en = db.Column(db.DateTime, server_default=db.func.now())
 
@@ -48,23 +49,7 @@ with app.app_context():
     except Exception:
         pass
 
-
-# ==== AUTO-MIGRATIONS (Alembic) ====
-if os.getenv("RUN_DB_MIGRATIONS") == "1":
-    try:
-        from alembic.config import Config as _AlbConfig
-        from alembic import command as _alb_command
-        _cfg = _AlbConfig(os.path.join(os.path.dirname(__file__), "alembic.ini"))
-        # Asegurar que Alembic use la misma URL normalizada de la app
-        _cfg.set_main_option("sqlalchemy.url", url)
-        with app.app_context():
-            _alb_command.upgrade(_cfg, "head")
-        print("Alembic auto-migrations: OK (upgrade head)")
-    except Exception as _e:
-        print("Alembic auto-migrations: ERROR ->", _e)
-# ==== FIN AUTO-MIGRATIONS ====
-
-# ==== UTILS AUTH ====
+# ===== AUTH UTILS =====
 def _make_token(user_id: int, email: str) -> str:
     now = datetime.datetime.utcnow()
     payload = {"sub": str(user_id), "email": email, "iat": now, "exp": now + datetime.timedelta(minutes=JWT_EXP_MIN)}
@@ -78,8 +63,7 @@ def _get_current_user():
     try:
         payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALG])
         uid = int(payload.get("sub", "0"))
-        user = User.query.get(uid)
-        return user
+        return User.query.get(uid)
     except Exception:
         return None
 
@@ -89,7 +73,7 @@ def _require_user():
         return None, (jsonify({"error": "no_autorizado"}), 401)
     return user, None
 
-# ==== HEALTH ====
+# ===== HEALTH =====
 @app.get("/health")
 def health():
     ok_db = False
@@ -107,7 +91,7 @@ def health():
         "error": err
     }), 200
 
-# ==== AUTH REAL ====
+# ===== AUTH REAL =====
 @app.post("/auth/register")
 def register():
     data = request.get_json(silent=True) or {}
@@ -117,9 +101,7 @@ def register():
         return jsonify({"error": "faltan_campos"}), 400
     if len(password) < 6:
         return jsonify({"error": "password_corta"}), 400
-
     try:
-        # ¿Existe?
         if User.query.filter_by(email=email).first():
             return jsonify({"error": "email_ya_existe"}), 409
         pw_hash = bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
@@ -147,11 +129,10 @@ def login():
         ok = False
     if not ok:
         return jsonify({"error": "credenciales_invalidas"}), 401
-
     token = _make_token(u.id, u.email)
     return jsonify({"access_token": token, "token_type": "bearer"}), 200
 
-# ==== USERS (demo) ====
+# ===== USERS =====
 @app.get("/users")
 def list_users():
     user, err = _require_user()
@@ -159,37 +140,34 @@ def list_users():
     users = User.query.order_by(User.id.asc()).limit(50).all()
     return jsonify([{"id": u.id, "email": u.email} for u in users]), 200
 
-# ==== COBROS ====
+# ===== COBROS =====
+def _parse_int(value, default):
+    try:
+        v = int(value)
+        return v if v > 0 else default
+    except Exception:
+        return default
+
 @app.get("/cobros")
 def get_cobros():
     user, err = _require_user()
     if err: return err
     estado = request.args.get("estado", "", type=str).strip().lower()
-    page = request.args.get("page", 1, type=int)
-    page_size = request.args.get("page_size", 20, type=int)
-    if page < 1: page = 1
-    if page_size < 1: page_size = 20
+    page = _parse_int(request.args.get("page", 1), 1)
+    page_size = _parse_int(request.args.get("page_size", 20), 20)
     if page_size > 100: page_size = 100
-
     q = Cobro.query
     if estado in ("pendiente", "pagado", "cancelado"):
         q = q.filter(Cobro.estado == estado)
-
     total = q.count()
     items = q.order_by(Cobro.id.desc()).offset((page-1)*page_size).limit(page_size).all()
     return jsonify({
-        "page": page,
-        "page_size": page_size,
-        "total": total,
-        "items": [
-            {
-                "id": c.id,
-                "monto": float(c.monto) if c.monto is not None else 0.0,
-                "descripcion": c.descripcion,
-                "estado": c.estado,
-                "creado_en": c.creado_en.isoformat() if c.creado_en else None
-            } for c in items
-        ]
+        "page": page, "page_size": page_size, "total": total,
+        "items": [{
+            "id": c.id, "monto": float(c.monto) if c.monto is not None else 0.0,
+            "descripcion": c.descripcion, "referencia": c.referencia,
+            "estado": c.estado, "creado_en": c.creado_en.isoformat() if c.creado_en else None
+        } for c in items]
     }), 200
 
 @app.post("/cobros")
@@ -204,21 +182,19 @@ def crear_cobro():
     if monto <= 0:
         return jsonify({"error": "monto_debe_ser_positivo"}), 400
     descripcion = (data.get("descripcion") or "").strip() or None
+    referencia = (data.get("referencia") or "").strip() or None
     estado = (data.get("estado") or "pendiente").strip().lower()
     if estado not in ("pendiente", "pagado", "cancelado"):
         return jsonify({"error": "estado_invalido"}), 400
-
     try:
         db.create_all()
-        nuevo = Cobro(monto=monto, descripcion=descripcion, estado=estado)
+        nuevo = Cobro(monto=monto, descripcion=descripcion, referencia=referencia, estado=estado)
         db.session.add(nuevo)
         db.session.commit()
         return jsonify({
-            "id": nuevo.id,
-            "monto": float(nuevo.monto),
-            "descripcion": nuevo.descripcion,
-            "estado": nuevo.estado,
-            "creado_en": nuevo.creado_en.isoformat() if nuevo.creado_en else None
+            "id": nuevo.id, "monto": float(nuevo.monto),
+            "descripcion": nuevo.descripcion, "referencia": nuevo.referencia,
+            "estado": nuevo.estado, "creado_en": nuevo.creado_en.isoformat() if nuevo.creado_en else None
         }), 201
     except Exception as e:
         db.session.rollback()
@@ -231,23 +207,28 @@ def actualizar_cobro(cobro_id: int):
     data = request.get_json(silent=True) or {}
     estado = data.get("estado")
     descripcion = data.get("descripcion")
-    if estado is None and descripcion is None:
+    referencia = data.get("referencia")
+
+    if estado is None and descripcion is None and referencia is None:
         return jsonify({"error": "nada_para_actualizar"}), 400
     if estado is not None:
         estado = str(estado).strip().lower()
         if estado not in ("pendiente", "pagado", "cancelado"):
             return jsonify({"error": "estado_invalido"}), 400
+
     c = Cobro.query.get(cobro_id)
     if not c:
         return jsonify({"error": "no_encontrado"}), 404
+
     try:
         if estado is not None: c.estado = estado
         if descripcion is not None: c.descripcion = (descripcion or "").strip() or None
+        if referencia is not None: c.referencia = (referencia or "").strip() or None
         db.session.commit()
         return jsonify({
             "id": c.id, "monto": float(c.monto),
-            "descripcion": c.descripcion, "estado": c.estado,
-            "creado_en": c.creado_en.isoformat() if c.creado_en else None
+            "descripcion": c.descripcion, "referencia": c.referencia,
+            "estado": c.estado, "creado_en": c.creado_en.isoformat() if c.creado_en else None
         }), 200
     except Exception as e:
         db.session.rollback()
@@ -267,3 +248,68 @@ def borrar_cobro(cobro_id: int):
     except Exception as e:
         db.session.rollback()
         return jsonify({"error": "db_error", "detail": str(e)}), 500
+
+# ====== OPENAPI (Swagger UI) ======
+def _openapi_spec():
+    return {
+        "openapi": "3.0.3",
+        "info": {"title": "NOA Cobros API", "version": "1.0.0"},
+        "servers": [{"url": "/"}],
+        "paths": {
+            "/health": {"get": {"summary": "Health", "responses": {"200": {"description": "OK"}}}},
+            "/auth/register": {"post": {"summary": "Registrar usuario","responses": {"201":{"description":"Creado"}}}},
+            "/auth/login": {"post": {"summary": "Login (JWT)","responses": {"200":{"description":"OK"}}}},
+            "/users": {"get": {"summary": "Listar usuarios","security": [{"bearerAuth": []}],"responses": {"200":{"description":"OK"}}}},
+            "/cobros": {
+                "get": {"summary": "Listar cobros","security":[{"bearerAuth":[]}],
+                        "parameters":[
+                            {"name":"estado","in":"query","schema":{"type":"string","enum":["pendiente","pagado","cancelado"]}},
+                            {"name":"page","in":"query","schema":{"type":"integer","minimum":1}},
+                            {"name":"page_size","in":"query","schema":{"type":"integer","minimum":1,"maximum":100}}
+                        ],
+                        "responses":{"200":{"description":"OK"}}},
+                "post":{"summary":"Crear cobro","security":[{"bearerAuth":[]}],
+                        "responses":{"201":{"description":"Creado"}}}
+            },
+            "/cobros/{id}": {
+                "patch":{"summary":"Actualizar cobro","security":[{"bearerAuth":[]}],
+                         "parameters":[{"name":"id","in":"path","required":True,"schema":{"type":"integer"}}],
+                         "responses":{"200":{"description":"OK"},"404":{"description":"No encontrado"}}},
+                "delete":{"summary":"Borrar cobro","security":[{"bearerAuth":[]}],
+                          "parameters":[{"name":"id","in":"path","required":True,"schema":{"type":"integer"}}],
+                          "responses":{"200":{"description":"OK"},"404":{"description":"No encontrado"}}}
+            }
+        },
+        "components": {"securitySchemes": {"bearerAuth": {"type": "http", "scheme": "bearer", "bearerFormat": "JWT"}}}
+    }
+
+@app.get("/openapi.json")
+def openapi_json():
+    return jsonify(_openapi_spec())
+
+@app.get("/docs")
+def docs():
+    html = f"""<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <title>NOA Cobros — Docs</title>
+  <link rel="stylesheet" href="https://unpkg.com/swagger-ui-dist/swagger-ui.css">
+  <style>body {{ margin:0; }} #swagger-ui {{ max-width: 1200px; margin: 0 auto; }}</style>
+</head>
+<body>
+  <div id="swagger-ui"></div>
+  <script src="https://unpkg.com/swagger-ui-dist/swagger-ui-bundle.js"></script>
+  <script>
+    window.ui = SwaggerUIBundle({{
+      url: '/openapi.json',
+      dom_id: '#swagger-ui',
+      presets: [SwaggerUIBundle.presets.apis],
+      layout: "BaseLayout"
+    }});
+  </script>
+</body>
+</html>"""
+    resp = make_response(html, 200)
+    resp.headers["Content-Type"] = "text/html; charset=utf-8"
+    return resp
