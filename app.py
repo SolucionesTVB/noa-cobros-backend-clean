@@ -18,8 +18,8 @@ def _normalize_db_url(raw: str) -> str:
 
 app = Flask(__name__)
 
-# === CORS: solo tu frontend, docs públicos ===
-FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "*")  # p.ej. https://polite-gumdrop-ba6be7.netlify.app
+# === CORS ===
+FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "*")
 CORS(app, resources={
     r"/docs": {"origins": "*"},
     r"/openapi.json": {"origins": "*"},
@@ -33,6 +33,7 @@ app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 JWT_SECRET = os.getenv("JWT_SECRET", "CÁMBIAME-POR-FAVOR")
 JWT_ALG = "HS256"
 JWT_EXP_MIN = int(os.getenv("JWT_EXP_MIN", "1440"))
+DEBUG_ERRORS = os.getenv("DEBUG_ERRORS", "1") == "1"  # 👈 deja 1 por ahora
 
 db.init_app(app)
 
@@ -48,7 +49,7 @@ class Cobro(db.Model):
     monto = db.Column(db.Float, nullable=False)
     descripcion = db.Column(db.String(255))
     referencia = db.Column(db.String(50))
-    estado = db.Column(db.String(20), nullable=False, default="pendiente")  # pendiente|pagado|cancelado
+    estado = db.Column(db.String(20), nullable=False, default="pendiente")
     creado_en = db.Column(db.DateTime, server_default=db.func.now())
 
 with app.app_context():
@@ -86,7 +87,7 @@ def _strict_origin():
     if FRONTEND_ORIGIN == "*" or request.method == "OPTIONS":
         return
     path = request.path or ""
-    publico = path.startswith("/docs") or path.startswith("/openapi.json") or path.startswith("/health")
+    publico = path.startswith("/docs") or path.startswith("/openapi.json") or path.startswith("/health") or path.startswith("/diag")
     if publico:
         return
     origin = request.headers.get("Origin", "")
@@ -111,7 +112,32 @@ def health():
         "error": err
     }), 200
 
-# ===== AUTH REAL =====
+# ===== DIAG =====
+@app.get("/diag")
+def diag():
+    out = {"jwt_secret_set": bool(JWT_SECRET), "db_url": url, "bcrypt_ok": False, "jwt_ok": False, "db_ok": False}
+    # bcrypt
+    try:
+        h = bcrypt.hashpw(b"test", bcrypt.gensalt())
+        out["bcrypt_ok"] = bcrypt.checkpw(b"test", h)
+    except Exception as e:
+        out["bcrypt_error"] = str(e)
+    # jwt
+    try:
+        tok = jwt.encode({"sub":"1","exp": datetime.datetime.utcnow() + datetime.timedelta(minutes=1)}, JWT_SECRET, algorithm=JWT_ALG)
+        jwt.decode(tok, JWT_SECRET, algorithms=[JWT_ALG])
+        out["jwt_ok"] = True
+    except Exception as e:
+        out["jwt_error"] = str(e)
+    # db
+    try:
+        db.session.execute(text("SELECT 1"))
+        out["db_ok"] = True
+    except Exception as e:
+        out["db_error"] = str(e)
+    return jsonify(out), 200
+
+# ===== AUTH =====
 @app.post("/auth/register")
 def register():
     data = request.get_json(silent=True) or {}
@@ -131,26 +157,60 @@ def register():
         return jsonify({"id": u.id, "email": u.email}), 201
     except Exception as e:
         db.session.rollback()
-        return jsonify({"error": "db_error", "detail": str(e)}), 500
+        msg = {"error": "db_error"}
+        if DEBUG_ERRORS: msg["detail"] = str(e)
+        return jsonify(msg), 500
 
 @app.post("/auth/login")
 def login():
-    data = request.get_json(silent=True) or {}
-    email = (data.get("email") or "").strip().lower()
-    password = (data.get("password") or "").strip()
-    if not email or not password:
-        return jsonify({"error": "faltan_campos"}), 400
-    u = User.query.filter_by(email=email).first()
-    if not u:
-        return jsonify({"error": "credenciales_invalidas"}), 401
     try:
-        ok = bcrypt.checkpw(password.encode("utf-8"), u.password_hash.encode("utf-8"))
-    except Exception:
-        ok = False
-    if not ok:
-        return jsonify({"error": "credenciales_invalidas"}), 401
-    token = _make_token(u.id, u.email)
-    return jsonify({"access_token": token, "token_type": "bearer"}), 200
+        data = request.get_json(silent=True) or {}
+        email = (data.get("email") or "").strip().lower()
+        password = (data.get("password") or "").strip()
+        if not email or not password:
+            return jsonify({"error": "faltan_campos"}), 400
+
+        # Buscar usuario
+        try:
+            u = User.query.filter_by(email=email).first()
+        except Exception as e:
+            msg = {"error": "db_error"}
+            if DEBUG_ERRORS: msg["detail"] = str(e)
+            return jsonify(msg), 500
+        if not u:
+            return jsonify({"error": "credenciales_invalidas"}), 401
+
+        # Verificar password
+        try:
+            ok = bcrypt.checkpw(password.encode("utf-8"), u.password_hash.encode("utf-8"))
+        except Exception as e:
+            msg = {"error": "bcrypt_error"}
+            if DEBUG_ERRORS: msg["detail"] = str(e)
+            return jsonify(msg), 500
+        if not ok:
+            return jsonify({"error": "credenciales_invalidas"}), 401
+
+        # Generar token
+        try:
+            token = _make_token(u.id, u.email)
+        except Exception as e:
+            msg = {"error": "jwt_error"}
+            if DEBUG_ERRORS: msg["detail"] = str(e)
+            return jsonify(msg), 500
+
+        return jsonify({"access_token": token, "token_type": "bearer"}), 200
+    except Exception as e:
+        msg = {"error": "login_exception"}
+        if DEBUG_ERRORS: msg["detail"] = str(e)
+        return jsonify(msg), 500
+
+# ===== USERS =====
+@app.get("/users")
+def list_users():
+    user, err = _require_user()
+    if err: return err
+    users = User.query.order_by(User.id.asc()).limit(50).all()
+    return jsonify([{"id": u.id, "email": u.email} for u in users]), 200
 
 # ===== COBROS =====
 def _parse_int(value, default):
@@ -161,7 +221,6 @@ def _parse_int(value, default):
         return default
 
 def _parse_date(s):
-    """YYYY-MM-DD -> datetime (inicio del día). Si vacío o mal, devuelve None."""
     if not s:
         return None
     try:
@@ -173,8 +232,6 @@ def _parse_date(s):
 def get_cobros():
     user, err = _require_user()
     if err: return err
-
-    # Filtros básicos
     estado = request.args.get("estado", "", type=str).strip().lower()
     desde_str = request.args.get("desde", "", type=str).strip()
     hasta_str = request.args.get("hasta", "", type=str).strip()
@@ -185,8 +242,6 @@ def get_cobros():
     q = Cobro.query
     if estado in ("pendiente", "pagado", "cancelado"):
         q = q.filter(Cobro.estado == estado)
-
-    # Filtro por fechas (incluye día completo)
     d_desde = _parse_date(desde_str)
     d_hasta = _parse_date(hasta_str)
     if d_desde:
@@ -234,7 +289,9 @@ def crear_cobro():
         }), 201
     except Exception as e:
         db.session.rollback()
-        return jsonify({"error": "db_error", "detail": str(e)}), 500
+        msg = {"error": "db_error"}
+        if DEBUG_ERRORS: msg["detail"] = str(e)
+        return jsonify(msg), 500
 
 @app.patch("/cobros/<int:cobro_id>")
 def actualizar_cobro(cobro_id: int):
@@ -265,7 +322,9 @@ def actualizar_cobro(cobro_id: int):
         }), 200
     except Exception as e:
         db.session.rollback()
-        return jsonify({"error": "db_error", "detail": str(e)}), 500
+        msg = {"error": "db_error"}
+        if DEBUG_ERRORS: msg["detail"] = str(e)
+        return jsonify(msg), 500
 
 @app.delete("/cobros/<int:cobro_id>")
 def borrar_cobro(cobro_id: int):
@@ -280,124 +339,15 @@ def borrar_cobro(cobro_id: int):
         return jsonify({"ok": True, "id": cobro_id}), 200
     except Exception as e:
         db.session.rollback()
-        return jsonify({"error": "db_error", "detail": str(e)}), 500
+        msg = {"error": "db_error"}
+        if DEBUG_ERRORS: msg["detail"] = str(e)
+        return jsonify(msg), 500
 
-# ===== EXPORT CSV =====
-@app.get("/cobros/export.csv")
-def export_cobros_csv():
-    user, err = _require_user()
-    if err: return err
-
-    estado = request.args.get("estado", "", type=str).strip().lower()
-    desde_str = request.args.get("desde", "", type=str).strip()
-    hasta_str = request.args.get("hasta", "", type=str).strip()
-
-    q = Cobro.query
-    if estado in ("pendiente", "pagado", "cancelado"):
-        q = q.filter(Cobro.estado == estado)
-
-    d_desde = _parse_date(desde_str)
-    d_hasta = _parse_date(hasta_str)
-    if d_desde:
-        q = q.filter(Cobro.creado_en >= d_desde)
-    if d_hasta:
-        fin = d_hasta + datetime.timedelta(days=1) - datetime.timedelta(seconds=1)
-        q = q.filter(Cobro.creado_en <= fin)
-
-    rows = q.order_by(Cobro.id.desc()).all()
-
-    # Construir CSV en memoria
-    buf = io.StringIO()
-    w = csv.writer(buf)
-    w.writerow(["id", "monto", "descripcion", "referencia", "estado", "creado_en"])
-    for c in rows:
-        w.writerow([
-            c.id,
-            (float(c.monto) if c.monto is not None else 0.0),
-            (c.descripcion or ""),
-            (c.referencia or ""),
-            c.estado,
-            (c.creado_en.isoformat() if c.creado_en else "")
-        ])
-
-    out = make_response(buf.getvalue())
-    out.headers["Content-Type"] = "text/csv; charset=utf-8"
-    fname = f"cobros_{datetime.datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.csv"
-    out.headers["Content-Disposition"] = f'attachment; filename="{fname}"'
-    return out, 200
-
-# ====== OPENAPI (Swagger UI) ======
-def _openapi_spec():
-    return {
-        "openapi": "3.0.3",
-        "info": {"title": "NOA Cobros API", "version": "1.1.0"},
-        "servers": [{"url": "/"}],
-        "paths": {
-            "/health": {"get": {"summary": "Health", "responses": {"200": {"description": "OK"}}}},
-            "/auth/register": {"post": {"summary": "Registrar usuario","responses": {"201":{"description":"Creado"}}}},
-            "/auth/login": {"post": {"summary": "Login (JWT)","responses": {"200":{"description":"OK"}}}},
-            "/users": {"get": {"summary": "Listar usuarios","security": [{"bearerAuth": []}],"responses": {"200":{"description":"OK"}}}},
-            "/cobros": {
-                "get": {"summary": "Listar cobros","security":[{"bearerAuth":[]}],
-                        "parameters":[
-                            {"name":"estado","in":"query","schema":{"type":"string","enum":["pendiente","pagado","cancelado"]}},
-                            {"name":"desde","in":"query","schema":{"type":"string","example":"2025-09-01"}},
-                            {"name":"hasta","in":"query","schema":{"type":"string","example":"2025-09-30"}},
-                            {"name":"page","in":"query","schema":{"type":"integer","minimum":1}},
-                            {"name":"page_size","in":"query","schema":{"type":"integer","minimum":1,"maximum":100}}
-                        ],
-                        "responses":{"200":{"description":"OK"}}},
-                "post":{"summary":"Crear cobro","security":[{"bearerAuth":[]}],
-                        "responses":{"201":{"description":"Creado"}}}
-            },
-            "/cobros/{id}": {
-                "patch":{"summary":"Actualizar cobro","security":[{"bearerAuth":[]}],
-                         "parameters":[{"name":"id","in":"path","required":True,"schema":{"type":"integer"}}],
-                         "responses":{"200":{"description":"OK"},"404":{"description":"No encontrado"}}},
-                "delete":{"summary":"Borrar cobro","security":[{"bearerAuth":[]}],
-                          "parameters":[{"name":"id","in":"path","required":True,"schema":{"type":"integer"}}],
-                          "responses":{"200":{"description":"OK"},"404":{"description":"No encontrado"}}}
-            },
-            "/cobros/export.csv": {
-                "get": {"summary":"Exportar cobros a CSV","security":[{"bearerAuth":[]}],
-                        "parameters":[
-                            {"name":"estado","in":"query","schema":{"type":"string","enum":["pendiente","pagado","cancelado"]}},
-                            {"name":"desde","in":"query","schema":{"type":"string","example":"2025-09-01"}},
-                            {"name":"hasta","in":"query","schema":{"type":"string","example":"2025-09-30"}}
-                        ],
-                        "responses":{"200":{"description":"CSV"}}}
-            }
-        },
-        "components": {"securitySchemes": {"bearerAuth": {"type": "http", "scheme": "bearer", "bearerFormat": "JWT"}}}
-    }
-
+# ===== OPENAPI (mínimo) =====
 @app.get("/openapi.json")
 def openapi_json():
-    return jsonify(_openapi_spec())
+    return jsonify({"openapi":"3.0.3","info":{"title":"NOA Cobros","version":"diag"}})
 
 @app.get("/docs")
 def docs():
-    html = f"""<!doctype html>
-<html>
-<head>
-  <meta charset="utf-8"/>
-  <title>NOA Cobros — Docs</title>
-  <link rel="stylesheet" href="https://unpkg.com/swagger-ui-dist/swagger-ui.css">
-  <style>body {{ margin:0; }} #swagger-ui {{ max-width: 1200px; margin: 0 auto; }}</style>
-</head>
-<body>
-  <div id="swagger-ui"></div>
-  <script src="https://unpkg.com/swagger-ui-dist/swagger-ui-bundle.js"></script>
-  <script>
-    window.ui = SwaggerUIBundle({{
-      url: '/openapi.json',
-      dom_id: '#swagger-ui',
-      presets: [SwaggerUIBundle.presets.apis],
-      layout: "BaseLayout"
-    }});
-  </script>
-</body>
-</html>"""
-    resp = make_response(html, 200)
-    resp.headers["Content-Type"] = "text/html; charset=utf-8"
-    return resp
+    return make_response("<h1>NOA Cobros Docs</h1><p>Ver /openapi.json</p>", 200)
