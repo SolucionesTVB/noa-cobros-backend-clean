@@ -482,6 +482,21 @@ def admin_routes():
     for r in app.url_map.iter_rules():
         rutas.append({"rule": str(r), "endpoint": r.endpoint, "methods": sorted(m for m in r.methods if m not in ("HEAD","OPTIONS"))})
     return jsonify({"ok": True, "count": len(rutas), "routes": rutas}), 200
+
+# ===== PUBLIC: __ok (diagnóstico live) =====
+@app.get("/__ok")
+def __ok():
+    try:
+        routes = [str(r) for r in app.url_map.iter_rules()]
+        has_stats = any("/stats" in r for r in routes)
+        return jsonify({
+            "ok": True,
+            "has_stats": has_stats,
+            "routes_count": len(routes),
+            "version": os.getenv("APP_VERSION", "") or str(int(time.time()))
+        }), 200
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
 # ===== OPENAPI (mínimo) =====
 @app.get("/openapi.json")
 def openapi_json():
