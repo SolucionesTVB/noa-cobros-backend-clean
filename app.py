@@ -149,6 +149,9 @@ def login():
         if not u:
             return jsonify({"error": "credenciales_invalidas"}), 401
 
+    # si el usuario no tiene hash, tratar como credencial inválida
+    if not getattr(u, "password_hash", None):
+        return jsonify({"error":"credenciales_invalidas"}), 401
         try:
             ok = bcrypt.checkpw(password.encode("utf-8"), u.password_hash.encode("utf-8"))
         except Exception as e:
@@ -399,6 +402,34 @@ def migrate_user_password_hash():
             changed = True
         db.session.commit()
         return jsonify({"ok": True, "changed": changed}), 200
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error":"db_error","detail":str(e)}), 500
+
+# ===== ADMIN: BACKFILL PASSWORDS PARA USUARIOS SIN HASH =====
+from sqlalchemy import inspect
+
+@app.post("/admin/backfill_user_passwords")
+def backfill_user_passwords():
+    ADMIN_SECRET = os.getenv("ADMIN_SECRET", "")
+    if request.headers.get("X-Admin-Secret","") != ADMIN_SECRET or not ADMIN_SECRET:
+        return jsonify({"error":"no_autorizado"}), 401
+    data = request.get_json(silent=True) or {}
+    temp_password = (data.get("temp_password") or os.getenv("ADMIN_TEMP_PASSWORD") or "Noa2025!").strip()
+    if len(temp_password) < 6:
+        return jsonify({"error":"temp_password_corto"}), 400
+    try:
+        # Usuarios con password_hash NULL o vacío
+        res = db.session.execute(text('SELECT id, email, password_hash FROM "user"'))
+        to_fix = [r[0] for r in res if not r[2]]
+        fixed = 0
+        if to_fix:
+            pw_hash = bcrypt.hashpw(temp_password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+            for uid in to_fix:
+                db.session.execute(text('UPDATE "user" SET password_hash = :h WHERE id = :i'), {"h": pw_hash, "i": uid})
+            db.session.commit()
+            fixed = len(to_fix)
+        return jsonify({"ok": True, "fixed": fixed, "temp_password_len": len(temp_password)}), 200
     except Exception as e:
         db.session.rollback()
         return jsonify({"error":"db_error","detail":str(e)}), 500
