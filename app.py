@@ -471,6 +471,17 @@ def migrate_user_columns():
     except Exception as e:
         db.session.rollback()
         return jsonify({"error":"db_error","detail":str(e)}), 500
+
+# ===== ADMIN: LISTAR RUTAS =====
+@app.get("/admin/routes")
+def admin_routes():
+    ADMIN_SECRET = os.getenv("ADMIN_SECRET", "")
+    if request.headers.get("X-Admin-Secret","") != ADMIN_SECRET or not ADMIN_SECRET:
+        return jsonify({"error":"no_autorizado"}), 401
+    rutas = []
+    for r in app.url_map.iter_rules():
+        rutas.append({"rule": str(r), "endpoint": r.endpoint, "methods": sorted(m for m in r.methods if m not in ("HEAD","OPTIONS"))})
+    return jsonify({"ok": True, "count": len(rutas), "routes": rutas}), 200
 # ===== OPENAPI (mínimo) =====
 @app.get("/openapi.json")
 def openapi_json():
