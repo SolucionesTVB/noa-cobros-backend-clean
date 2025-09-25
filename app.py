@@ -710,4 +710,21 @@ def admin_user_schema():
         return jsonify({"ok": True, "columns": cols}), 200
     except Exception as e:
         return jsonify({"error": "db_error", "detail": str(e)}), 500
+        # ===== NOA: health y rutas de diagnóstico =====
+import time, os
+from flask import jsonify, request
+
+@app.get("/__ok")
+def __ok():
+    try:
+        routes = [str(r) for r in app.url_map.iter_rules()]
+        return jsonify({
+            "ok": True,
+            "routes_count": len(routes),
+            "has_stats": any("/stats" in r for r in routes),
+            "version": os.getenv("APP_VERSION", "") or str(int(time.time()))
+        }), 200
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
 
