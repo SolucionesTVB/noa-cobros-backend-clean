@@ -433,6 +433,44 @@ def backfill_user_passwords():
     except Exception as e:
         db.session.rollback()
         return jsonify({"error":"db_error","detail":str(e)}), 500
+
+# ===== ADMIN: MIGRACIÓN COLUMNA USER (password_hash + creado_en) =====
+from sqlalchemy import inspect
+
+@app.post("/admin/migrate_user_columns")
+def migrate_user_columns():
+    ADMIN_SECRET = os.getenv("ADMIN_SECRET", "")
+    if request.headers.get("X-Admin-Secret","") != ADMIN_SECRET or not ADMIN_SECRET:
+        return jsonify({"error":"no_autorizado"}), 401
+    try:
+        insp = inspect(db.engine)
+        cols = {c['name'] for c in insp.get_columns('user')}
+        changed = {"password_hash": False, "creado_en": False, "backfill_creado_en": False}
+
+        # 1) password_hash si falta
+        if "password_hash" not in cols:
+            db.session.execute(text('ALTER TABLE "user" ADD COLUMN password_hash VARCHAR(255)'))
+            changed["password_hash"] = True
+
+        # 2) creado_en si falta (sin zona horaria para compatibilidad)
+        if "creado_en" not in cols:
+            db.session.execute(text('ALTER TABLE "user" ADD COLUMN creado_en TIMESTAMP'))
+            # Rellenar existentes con NOW()
+            db.session.execute(text('UPDATE "user" SET creado_en = NOW() WHERE creado_en IS NULL'))
+            changed["creado_en"] = True
+            changed["backfill_creado_en"] = True
+        else:
+            # Si existe pero hay NULLs, backfill
+            db.session.execute(text('UPDATE "user" SET creado_en = NOW() WHERE creado_en IS NULL'))
+            # Saber si realmente tocó filas:
+            # (No siempre es trivial contar aquí sin otra query; lo dejamos informativo)
+            changed["backfill_creado_en"] = True
+
+        db.session.commit()
+        return jsonify({"ok": True, "changed": changed}), 200
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error":"db_error","detail":str(e)}), 500
 # ===== OPENAPI (mínimo) =====
 @app.get("/openapi.json")
 def openapi_json():
