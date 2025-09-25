@@ -1,4 +1,10 @@
 import os, datetime, io, csv
+# === IMPORTS NECESARIOS (agregar si faltan) ===
+import os
+import time
+from flask import request, jsonify
+from sqlalchemy import inspect, text
+import bcrypt  # si no lo usás, igual no molesta
 from collections import defaultdict
 from flask import Flask, jsonify, request, make_response
 from flask_sqlalchemy import SQLAlchemy
@@ -553,3 +559,155 @@ def openapi_json():
 @app.get("/docs")
 def docs():
     return make_response("<h1>NOA Cobros Docs</h1><p>Ver /openapi.json</p>", 200)
+    # =========================
+# ADMIN / HEALTH ENDPOINTS
+# =========================
+
+# --- PÚBLICO: __ok (diagnóstico) ---
+@app.get("/__ok")
+def __ok():
+    try:
+        rutas = [str(r) for r in app.url_map.iter_rules()]
+        has_stats = any("/stats" in r for r in rutas)
+        return jsonify({
+            "ok": True,
+            "has_stats": has_stats,
+            "routes_count": len(rutas),
+            "version": os.getenv("APP_VERSION", "") or str(int(time.time()))
+        }), 200
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+# --- ADMIN: listar rutas reales (protegido) ---
+@app.get("/admin/routes")
+def admin_routes():
+    ADMIN_SECRET = os.getenv("ADMIN_SECRET", "")
+    if request.headers.get("X-Admin-Secret", "") != ADMIN_SECRET or not ADMIN_SECRET:
+        return jsonify({"error": "no_autorizado"}), 401
+    try:
+        rutas = []
+        for r in app.url_map.iter_rules():
+            rutas.append({
+                "rule": str(r),
+                "endpoint": r.endpoint,
+                "methods": sorted(m for m in r.methods if m not in ("HEAD", "OPTIONS"))
+            })
+        return jsonify({"ok": True, "count": len(rutas), "routes": rutas}), 200
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+# --- ADMIN: crear columnas que faltan (password_hash, creado_en) ---
+@app.post("/admin/migrate_user_columns")
+def migrate_user_columns():
+    ADMIN_SECRET = os.getenv("ADMIN_SECRET", "")
+    if request.headers.get("X-Admin-Secret", "") != ADMIN_SECRET or not ADMIN_SECRET:
+        return jsonify({"error": "no_autorizado"}), 401
+    try:
+        insp = inspect(db.engine)
+        cols = {c['name'] for c in insp.get_columns('user')}
+        changed = {"password_hash": False, "creado_en": False, "backfill_creado_en": False}
+
+        if "password_hash" not in cols:
+            db.session.execute(text('ALTER TABLE "user" ADD COLUMN password_hash VARCHAR(255)'))
+            changed["password_hash"] = True
+
+        if "creado_en" not in cols:
+            db.session.execute(text('ALTER TABLE "user" ADD COLUMN creado_en TIMESTAMP'))
+            db.session.execute(text('UPDATE "user" SET creado_en = NOW() WHERE creado_en IS NULL'))
+            changed["creado_en"] = True
+            changed["backfill_creado_en"] = True
+        else:
+            db.session.execute(text('UPDATE "user" SET creado_en = NOW() WHERE creado_en IS NULL'))
+            changed["backfill_creado_en"] = True
+
+        db.session.commit()
+        return jsonify({"ok": True, "changed": changed}), 200
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": "db_error", "detail": str(e)}), 500
+
+
+# --- ADMIN: poner password hash temporal a usuarios sin hash ---
+@app.post("/admin/backfill_user_passwords")
+def backfill_user_passwords():
+    ADMIN_SECRET = os.getenv("ADMIN_SECRET", "")
+    if request.headers.get("X-Admin-Secret", "") != ADMIN_SECRET or not ADMIN_SECRET:
+        return jsonify({"error": "no_autorizado"}), 401
+    try:
+        data = request.get_json(silent=True) or {}
+        temp_password = (data.get("temp_password") or os.getenv("ADMIN_TEMP_PASSWORD") or "Noa2025!").strip()
+        if len(temp_password) < 6:
+            return jsonify({"error": "temp_password_corto"}), 400
+
+        # Buscar usuarios sin hash
+        rows = db.session.execute(text('SELECT id, email, password_hash FROM "user"')).fetchall()
+        to_fix = [r[0] for r in rows if not r[2]]
+
+        fixed = 0
+        if to_fix:
+            pw_hash = bcrypt.hashpw(temp_password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+            for uid in to_fix:
+                db.session.execute(text('UPDATE "user" SET password_hash = :h WHERE id = :i'),
+                                   {"h": pw_hash, "i": uid})
+            db.session.commit()
+            fixed = len(to_fix)
+
+        return jsonify({"ok": True, "fixed": fixed}), 200
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": "db_error", "detail": str(e)}), 500
+
+
+# --- ADMIN: fix combinado (idempotente) ---
+@app.post("/admin/fix_user_table")
+def admin_fix_user_table():
+    ADMIN_SECRET = os.getenv("ADMIN_SECRET", "")
+    if request.headers.get("X-Admin-Secret", "") != ADMIN_SECRET or not ADMIN_SECRET:
+        return jsonify({"error": "no_autorizado"}), 401
+    try:
+        db.session.execute(text('ALTER TABLE "user" ADD COLUMN IF NOT EXISTS password_hash VARCHAR(255)'))
+        db.session.execute(text('ALTER TABLE "user" ADD COLUMN IF NOT EXISTS creado_en TIMESTAMP'))
+        db.session.execute(text('UPDATE "user" SET creado_en = NOW() WHERE creado_en IS NULL'))
+        db.session.commit()
+
+        null_pw = db.session.execute(
+            text('SELECT count(*) FROM "user" WHERE password_hash IS NULL OR password_hash = \'\'')
+        ).scalar() or 0
+        null_ce = db.session.execute(
+            text('SELECT count(*) FROM "user" WHERE creado_en IS NULL')
+        ).scalar() or 0
+
+        return jsonify({"ok": True, "null_password_hash": null_pw, "null_creado_en": null_ce}), 200
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": "db_error", "detail": str(e)}), 500
+
+
+# --- ADMIN: ver columnas reales de la tabla user ---
+@app.get("/admin/user_schema")
+def admin_user_schema():
+    ADMIN_SECRET = os.getenv("ADMIN_SECRET", "")
+    if request.headers.get("X-Admin-Secret", "") != ADMIN_SECRET or not ADMIN_SECRET:
+        return jsonify({"error": "no_autorizado"}), 401
+    try:
+        try:
+            # Intento 1: dialect.get_columns
+            cols = []
+            with db.engine.connect() as conn:
+                for c in db.engine.dialect.get_columns(conn, 'user'):
+                    cols.append({
+                        "name": c.get("name"),
+                        "type": str(c.get("type")),
+                        "nullable": c.get("nullable")
+                    })
+        except Exception:
+            # Intento 2: inspector
+            insp = inspect(db.engine)
+            cols = [{"name": c["name"], "type": str(c.get("type")), "nullable": c.get("nullable")}
+                    for c in insp.get_columns('user')]
+        return jsonify({"ok": True, "columns": cols}), 200
+    except Exception as e:
+        return jsonify({"error": "db_error", "detail": str(e)}), 500
+
