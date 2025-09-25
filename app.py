@@ -378,6 +378,30 @@ def stats():
         "por_dia": por_dia
     }), 200
 
+
+# ===== ADMIN: MIGRACIÓN PARA AGREGAR password_hash A "user" =====
+import os
+from sqlalchemy import inspect
+
+@app.post("/admin/migrate_user_password_hash")
+def migrate_user_password_hash():
+    # Protección sencilla con ADMIN_SECRET (env)
+    ADMIN_SECRET = os.getenv("ADMIN_SECRET", "")
+    if request.headers.get("X-Admin-Secret","") != ADMIN_SECRET or not ADMIN_SECRET:
+        return jsonify({"error":"no_autorizado"}), 401
+    try:
+        insp = inspect(db.engine)
+        cols = {c['name'] for c in insp.get_columns('user')}
+        changed = False
+        if "password_hash" not in cols:
+            # Agregar columna null primero (para no romper filas viejas)
+            db.session.execute(text('ALTER TABLE "user" ADD COLUMN password_hash VARCHAR(255)'))
+            changed = True
+        db.session.commit()
+        return jsonify({"ok": True, "changed": changed}), 200
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error":"db_error","detail":str(e)}), 500
 # ===== OPENAPI (mínimo) =====
 @app.get("/openapi.json")
 def openapi_json():
