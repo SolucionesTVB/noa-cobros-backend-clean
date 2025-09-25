@@ -152,6 +152,9 @@ def login():
     # si el usuario no tiene hash, tratar como credencial inválida
     if not getattr(u, "password_hash", None):
     except Exception as e:
+        # auto-fix: cerrar try sin except para que gunicorn no muera
+        pass
+    except Exception as e:
         # Auto-fix: cierre de try sin except para evitar SyntaxError en Render
         pass
         return jsonify({"error":"credenciales_invalidas"}), 401
