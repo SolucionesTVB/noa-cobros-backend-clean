@@ -1,8 +1,9 @@
 import os, datetime, io, csv
+from collections import defaultdict
 from flask import Flask, jsonify, request, make_response
 from flask_sqlalchemy import SQLAlchemy
 from flask_cors import CORS
-from sqlalchemy import text
+from sqlalchemy import text, func
 import bcrypt, jwt
 
 db = SQLAlchemy()
@@ -33,7 +34,7 @@ app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 JWT_SECRET = os.getenv("JWT_SECRET", "CÁMBIAME-POR-FAVOR")
 JWT_ALG = "HS256"
 JWT_EXP_MIN = int(os.getenv("JWT_EXP_MIN", "1440"))
-DEBUG_ERRORS = os.getenv("DEBUG_ERRORS", "1") == "1"  # 👈 deja 1 por ahora
+DEBUG_ERRORS = os.getenv("DEBUG_ERRORS", "0") == "1"
 
 db.init_app(app)
 
@@ -49,7 +50,7 @@ class Cobro(db.Model):
     monto = db.Column(db.Float, nullable=False)
     descripcion = db.Column(db.String(255))
     referencia = db.Column(db.String(50))
-    estado = db.Column(db.String(20), nullable=False, default="pendiente")
+    estado = db.Column(db.String(20), nullable=False, default="pendiente")  # pendiente|pagado|cancelado
     creado_en = db.Column(db.DateTime, server_default=db.func.now())
 
 with app.app_context():
@@ -58,7 +59,7 @@ with app.app_context():
     except Exception:
         pass
 
-# ==== UTILS AUTH ====
+# ==== AUTH UTILS ====
 def _make_token(user_id: int, email: str) -> str:
     now = datetime.datetime.utcnow()
     payload = {"sub": str(user_id), "email": email, "iat": now, "exp": now + datetime.timedelta(minutes=JWT_EXP_MIN)}
@@ -87,7 +88,7 @@ def _strict_origin():
     if FRONTEND_ORIGIN == "*" or request.method == "OPTIONS":
         return
     path = request.path or ""
-    publico = path.startswith("/docs") or path.startswith("/openapi.json") or path.startswith("/health") or path.startswith("/diag")
+    publico = path.startswith("/docs") or path.startswith("/openapi.json") or path.startswith("/health")
     if publico:
         return
     origin = request.headers.get("Origin", "")
@@ -112,31 +113,6 @@ def health():
         "error": err
     }), 200
 
-# ===== DIAG =====
-@app.get("/diag")
-def diag():
-    out = {"jwt_secret_set": bool(JWT_SECRET), "db_url": url, "bcrypt_ok": False, "jwt_ok": False, "db_ok": False}
-    # bcrypt
-    try:
-        h = bcrypt.hashpw(b"test", bcrypt.gensalt())
-        out["bcrypt_ok"] = bcrypt.checkpw(b"test", h)
-    except Exception as e:
-        out["bcrypt_error"] = str(e)
-    # jwt
-    try:
-        tok = jwt.encode({"sub":"1","exp": datetime.datetime.utcnow() + datetime.timedelta(minutes=1)}, JWT_SECRET, algorithm=JWT_ALG)
-        jwt.decode(tok, JWT_SECRET, algorithms=[JWT_ALG])
-        out["jwt_ok"] = True
-    except Exception as e:
-        out["jwt_error"] = str(e)
-    # db
-    try:
-        db.session.execute(text("SELECT 1"))
-        out["db_ok"] = True
-    except Exception as e:
-        out["db_error"] = str(e)
-    return jsonify(out), 200
-
 # ===== AUTH =====
 @app.post("/auth/register")
 def register():
@@ -157,8 +133,7 @@ def register():
         return jsonify({"id": u.id, "email": u.email}), 201
     except Exception as e:
         db.session.rollback()
-        msg = {"error": "db_error"}
-        if DEBUG_ERRORS: msg["detail"] = str(e)
+        msg = {"error": "db_error"};  msg["detail"] = str(e) if DEBUG_ERRORS else "db_fail"
         return jsonify(msg), 500
 
 @app.post("/auth/login")
@@ -170,64 +145,42 @@ def login():
         if not email or not password:
             return jsonify({"error": "faltan_campos"}), 400
 
-        # Buscar usuario
-        try:
-            u = User.query.filter_by(email=email).first()
-        except Exception as e:
-            msg = {"error": "db_error"}
-            if DEBUG_ERRORS: msg["detail"] = str(e)
-            return jsonify(msg), 500
+        u = User.query.filter_by(email=email).first()
         if not u:
             return jsonify({"error": "credenciales_invalidas"}), 401
 
-        # Verificar password
         try:
             ok = bcrypt.checkpw(password.encode("utf-8"), u.password_hash.encode("utf-8"))
         except Exception as e:
-            msg = {"error": "bcrypt_error"}
-            if DEBUG_ERRORS: msg["detail"] = str(e)
+            msg = {"error": "bcrypt_error"}; msg["detail"] = str(e) if DEBUG_ERRORS else "bcrypt_fail"
             return jsonify(msg), 500
         if not ok:
             return jsonify({"error": "credenciales_invalidas"}), 401
 
-        # Generar token
         try:
             token = _make_token(u.id, u.email)
         except Exception as e:
-            msg = {"error": "jwt_error"}
-            if DEBUG_ERRORS: msg["detail"] = str(e)
+            msg = {"error": "jwt_error"}; msg["detail"] = str(e) if DEBUG_ERRORS else "jwt_fail"
             return jsonify(msg), 500
 
         return jsonify({"access_token": token, "token_type": "bearer"}), 200
     except Exception as e:
-        msg = {"error": "login_exception"}
-        if DEBUG_ERRORS: msg["detail"] = str(e)
+        msg = {"error": "login_exception"}; msg["detail"] = str(e) if DEBUG_ERRORS else "login_fail"
         return jsonify(msg), 500
 
-# ===== USERS =====
-@app.get("/users")
-def list_users():
-    user, err = _require_user()
-    if err: return err
-    users = User.query.order_by(User.id.asc()).limit(50).all()
-    return jsonify([{"id": u.id, "email": u.email} for u in users]), 200
-
-# ===== COBROS =====
+# ===== HELPERS =====
 def _parse_int(value, default):
     try:
-        v = int(value)
-        return v if v > 0 else default
+        v = int(value);  return v if v > 0 else default
     except Exception:
         return default
 
 def _parse_date(s):
-    if not s:
-        return None
-    try:
-        return datetime.datetime.strptime(s, "%Y-%m-%d")
-    except Exception:
-        return None
+    if not s: return None
+    try: return datetime.datetime.strptime(s, "%Y-%m-%d")
+    except Exception: return None
 
+# ===== COBROS CRUD =====
 @app.get("/cobros")
 def get_cobros():
     user, err = _require_user()
@@ -244,8 +197,7 @@ def get_cobros():
         q = q.filter(Cobro.estado == estado)
     d_desde = _parse_date(desde_str)
     d_hasta = _parse_date(hasta_str)
-    if d_desde:
-        q = q.filter(Cobro.creado_en >= d_desde)
+    if d_desde: q = q.filter(Cobro.creado_en >= d_desde)
     if d_hasta:
         fin = d_hasta + datetime.timedelta(days=1) - datetime.timedelta(seconds=1)
         q = q.filter(Cobro.creado_en <= fin)
@@ -289,8 +241,7 @@ def crear_cobro():
         }), 201
     except Exception as e:
         db.session.rollback()
-        msg = {"error": "db_error"}
-        if DEBUG_ERRORS: msg["detail"] = str(e)
+        msg = {"error": "db_error"}; msg["detail"] = str(e) if DEBUG_ERRORS else "db_fail"
         return jsonify(msg), 500
 
 @app.patch("/cobros/<int:cobro_id>")
@@ -308,8 +259,7 @@ def actualizar_cobro(cobro_id: int):
         if estado not in ("pendiente", "pagado", "cancelado"):
             return jsonify({"error": "estado_invalido"}), 400
     c = Cobro.query.get(cobro_id)
-    if not c:
-        return jsonify({"error": "no_encontrado"}), 404
+    if not c: return jsonify({"error": "no_encontrado"}), 404
     try:
         if estado is not None: c.estado = estado
         if descripcion is not None: c.descripcion = (descripcion or "").strip() or None
@@ -322,8 +272,7 @@ def actualizar_cobro(cobro_id: int):
         }), 200
     except Exception as e:
         db.session.rollback()
-        msg = {"error": "db_error"}
-        if DEBUG_ERRORS: msg["detail"] = str(e)
+        msg = {"error": "db_error"}; msg["detail"] = str(e) if DEBUG_ERRORS else "db_fail"
         return jsonify(msg), 500
 
 @app.delete("/cobros/<int:cobro_id>")
@@ -331,22 +280,109 @@ def borrar_cobro(cobro_id: int):
     user, err = _require_user()
     if err: return err
     c = Cobro.query.get(cobro_id)
-    if not c:
-        return jsonify({"error": "no_encontrado"}), 404
+    if not c: return jsonify({"error": "no_encontrado"}), 404
     try:
         db.session.delete(c)
         db.session.commit()
         return jsonify({"ok": True, "id": cobro_id}), 200
     except Exception as e:
         db.session.rollback()
-        msg = {"error": "db_error"}
-        if DEBUG_ERRORS: msg["detail"] = str(e)
+        msg = {"error": "db_error"}; msg["detail"] = str(e) if DEBUG_ERRORS else "db_fail"
         return jsonify(msg), 500
+
+# ===== EXPORT CSV =====
+@app.get("/cobros/export.csv")
+def export_cobros_csv():
+    user, err = _require_user()
+    if err: return err
+    estado = request.args.get("estado", "", type=str).strip().lower()
+    desde_str = request.args.get("desde", "", type=str).strip()
+    hasta_str = request.args.get("hasta", "", type=str).strip()
+
+    q = Cobro.query
+    if estado in ("pendiente", "pagado", "cancelado"):
+        q = q.filter(Cobro.estado == estado)
+    d_desde = _parse_date(desde_str)
+    d_hasta = _parse_date(hasta_str)
+    if d_desde: q = q.filter(Cobro.creado_en >= d_desde)
+    if d_hasta:
+        fin = d_hasta + datetime.timedelta(days=1) - datetime.timedelta(seconds=1)
+        q = q.filter(Cobro.creado_en <= fin)
+
+    rows = q.order_by(Cobro.id.desc()).all()
+
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(["id", "monto", "descripcion", "referencia", "estado", "creado_en"])
+    for c in rows:
+        w.writerow([
+            c.id,
+            (float(c.monto) if c.monto is not None else 0.0),
+            (c.descripcion or ""),
+            (c.referencia or ""),
+            c.estado,
+            (c.creado_en.isoformat() if c.creado_en else "")
+        ])
+    out = make_response(buf.getvalue())
+    out.headers["Content-Type"] = "text/csv; charset=utf-8"
+    fname = f"cobros_{datetime.datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.csv"
+    out.headers["Content-Disposition"] = f'attachment; filename="{fname}"'
+    return out, 200
+
+# ===== STATS =====
+@app.get("/stats")
+def stats():
+    user, err = _require_user()
+    if err: return err
+    estado = request.args.get("estado", "", type=str).strip().lower()
+    desde_str = request.args.get("desde", "", type=str).strip()
+    hasta_str = request.args.get("hasta", "", type=str).strip()
+
+    q = Cobro.query
+    if estado in ("pendiente", "pagado", "cancelado"):
+        q = q.filter(Cobro.estado == estado)
+
+    d_desde = _parse_date(desde_str)
+    d_hasta = _parse_date(hasta_str)
+    if d_desde: q = q.filter(Cobro.creado_en >= d_desde)
+    if d_hasta:
+        fin = d_hasta + datetime.timedelta(days=1) - datetime.timedelta(seconds=1)
+        q = q.filter(Cobro.creado_en <= fin)
+
+    # Resumen general
+    cantidad = q.count()
+    monto_total = float(sum((c.monto or 0.0) for c in q.with_entities(Cobro.monto).all())) if cantidad else 0.0
+
+    # Totales por estado (si no filtraste por estado)
+    por_estado = {"pendiente": {"cantidad": 0, "monto": 0.0},
+                  "pagado": {"cantidad": 0, "monto": 0.0},
+                  "cancelado": {"cantidad": 0, "monto": 0.0}}
+    for row in q.with_entities(Cobro.estado, func.count(Cobro.id), func.sum(Cobro.monto)).group_by(Cobro.estado).all():
+        est = row[0] or ""
+        if est in por_estado:
+            por_estado[est]["cantidad"] = int(row[1] or 0)
+            por_estado[est]["monto"] = float(row[2] or 0.0)
+
+    # Totales por día (compatibles con SQLite y Postgres)
+    fecha_expr = func.date(Cobro.creado_en)  # funciona en ambos
+    por_dia_rows = (q.with_entities(fecha_expr.label("fecha"), func.count(Cobro.id), func.sum(Cobro.monto))
+                      .group_by("fecha").order_by("fecha").all())
+    por_dia = [{"fecha": str(r[0]), "cantidad": int(r[1] or 0), "monto": float(r[2] or 0.0)} for r in por_dia_rows]
+
+    return jsonify({
+        "filtros": {"estado": (estado if estado in ("pendiente","pagado","cancelado") else None),
+                    "desde": (d_desde.strftime("%Y-%m-%d") if d_desde else None),
+                    "hasta": (d_hasta.strftime("%Y-%m-%d") if d_hasta else None)},
+        "resumen": {"cantidad": int(cantidad), "monto_total": float(monto_total)},
+        "por_estado": por_estado,
+        "por_dia": por_dia
+    }), 200
 
 # ===== OPENAPI (mínimo) =====
 @app.get("/openapi.json")
 def openapi_json():
-    return jsonify({"openapi":"3.0.3","info":{"title":"NOA Cobros","version":"diag"}})
+    return jsonify({"openapi":"3.0.3","info":{"title":"NOA Cobros","version":"1.2.0"},
+                    "paths":{"health":{},"auth/login":{},"cobros":{},"stats":{} }})
 
 @app.get("/docs")
 def docs():
