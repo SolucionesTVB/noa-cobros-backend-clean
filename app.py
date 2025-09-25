@@ -497,6 +497,47 @@ def __ok():
         }), 200
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
+
+# ===== ADMIN: FIX TABLA USER (password_hash + creado_en) =====
+@app.post("/admin/fix_user_table")
+def admin_fix_user_table():
+    ADMIN_SECRET = os.getenv("ADMIN_SECRET","")
+    if request.headers.get("X-Admin-Secret","") != ADMIN_SECRET or not ADMIN_SECRET:
+        return jsonify({"error":"no_autorizado"}), 401
+    try:
+        # Crear columnas si faltan (idempotente)
+        db.session.execute(text('ALTER TABLE "user" ADD COLUMN IF NOT EXISTS password_hash VARCHAR(255)'))
+        db.session.execute(text('ALTER TABLE "user" ADD COLUMN IF NOT EXISTS creado_en TIMESTAMP'))
+        # Backfill creado_en
+        db.session.execute(text('UPDATE "user" SET creado_en = NOW() WHERE creado_en IS NULL'))
+        db.session.commit()
+        # Controles: contar NULLs pendientes
+        res = db.session.execute(text('SELECT count(*) FROM "user" WHERE password_hash IS NULL OR password_hash = \'\''))
+        null_pw = res.scalar() or 0
+        res = db.session.execute(text('SELECT count(*) FROM "user" WHERE creado_en IS NULL'))
+        null_ce = res.scalar() or 0
+        return jsonify({"ok": True, "null_password_hash": null_pw, "null_creado_en": null_ce}), 200
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error":"db_error","detail":str(e)}), 500
+
+# ===== ADMIN: VER ESQUEMA USER =====
+@app.get("/admin/user_schema")
+def admin_user_schema():
+    ADMIN_SECRET = os.getenv("ADMIN_SECRET","")
+    if request.headers.get("X-Admin-Secret","") != ADMIN_SECRET or not ADMIN_SECRET:
+        return jsonify({"error":"no_autorizado"}), 401
+    try:
+        cols = []
+        for c in db.engine.dialect.get_columns(db.engine.connect(), 'user'):
+            cols.append({"name": c.get("name"), "type": str(c.get("type")), "nullable": c.get("nullable")})
+        # Fallback si dialect.get_columns no está: usa reflexión de SQL
+    except Exception:
+        from sqlalchemy import inspect
+        insp = inspect(db.engine)
+        cols = [{"name": c["name"], "type": str(c.get("type")), "nullable": c.get("nullable")} for c in insp.get_columns('user')]
+    return jsonify({"ok": True, "columns": cols}), 200
+
 # ===== OPENAPI (mínimo) =====
 @app.get("/openapi.json")
 def openapi_json():
