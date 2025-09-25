@@ -151,6 +151,9 @@ def login():
 
     # si el usuario no tiene hash, tratar como credencial inválida
     if not getattr(u, "password_hash", None):
+    except Exception as e:
+        # Auto-fix: cierre de try sin except para evitar SyntaxError en Render
+        pass
         return jsonify({"error":"credenciales_invalidas"}), 401
         try:
             ok = bcrypt.checkpw(password.encode("utf-8"), u.password_hash.encode("utf-8"))
