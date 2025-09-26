@@ -1,7 +1,7 @@
-# app.py — NOA Cobros (backend limpio y completo)
+# app.py — NOA Cobros (backend limpio y completo, SIN parches)
 # ---------------------------------------------
 # Requiere: Flask, Flask-Cors, SQLAlchemy, psycopg[binary], bcrypt, PyJWT
-# Vars de entorno:
+# Env:
 #   DATABASE_URL       (Render la pone)
 #   JWT_SECRET         (obligatoria)
 #   ADMIN_SECRET       (para /admin/routes)
@@ -34,7 +34,7 @@ def _normalize_db_url(raw: str) -> str:
 DB_URL = _normalize_db_url(os.getenv("DATABASE_URL", "sqlite:///local.db"))
 JWT_SECRET = os.getenv("JWT_SECRET", "dev-inseguro-cambia-esto")
 ADMIN_SECRET = os.getenv("ADMIN_SECRET", "changeme-admin")
-FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN")  # ej: https://polite-gumdrop-ba6be7.netlify.app
+FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN")
 
 app = Flask(__name__)
 app.config["SQLALCHEMY_DATABASE_URI"] = DB_URL
@@ -66,7 +66,7 @@ class Cobro(db.Model):
 # ------------------ Helpers ------------------
 
 def ensure_user_columns():
-    """Mini-migrador: agrega columnas faltantes en tabla user (instalaciones viejas)."""
+    """Asegura columnas mínimas de 'user' en DB viejas."""
     with app.app_context():
         try:
             db.session.execute(text('ALTER TABLE "user" ADD COLUMN IF NOT EXISTS password_hash VARCHAR(255);'))
@@ -76,10 +76,22 @@ def ensure_user_columns():
             db.session.rollback()
             app.logger.error(f"ensure_user_columns error: {e}")
 
+def ensure_cobro_columns():
+    """Asegura columnas mínimas de 'cobro' en DB viejas."""
+    with app.app_context():
+        try:
+            db.session.execute(text('ALTER TABLE "cobro" ADD COLUMN IF NOT EXISTS referencia VARCHAR(100);'))
+            db.session.commit()
+        except Exception as e:
+            db.session.rollback()
+            app.logger.error(f"ensure_cobro_columns error: {e}")
+
 def create_tables_once():
+    """Crea tablas y asegura columnas faltantes (idempotente)."""
     with app.app_context():
         db.create_all()
         ensure_user_columns()
+        ensure_cobro_columns()
 
 def make_token(email: str) -> str:
     payload = {"sub": email, "exp": datetime.utcnow() + timedelta(hours=12), "iat": datetime.utcnow()}
@@ -291,7 +303,7 @@ def stats():
     total = sum(float(x.monto or 0.0) for x in items)
     count = len(items)
     pagados = sum(1 for x in items if x.estado == "pagado")
-    pendientes = sum(1 for x in items if x.estado == "pendiente")
+    pendientes = sum(1 for x in items si x.estado == "pendiente")  # noqa
 
     return jsonify({"count": count, "total": total, "pagados": pagados, "pendientes": pendientes}), 200
 
