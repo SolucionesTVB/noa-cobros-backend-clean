@@ -1,718 +1,121 @@
-import os, datetime, io, csv
-# === IMPORTS NECESARIOS (agregar si faltan) ===
+# app.py — NOA Cobros (limpio)
+# ---------------------------------------------
+# Requisitos: Flask, Flask-Cors, SQLAlchemy, psycopg[binary], bcrypt, PyJWT
+# Variables de entorno usadas:
+# - DATABASE_URL (Render la pone)
+# - JWT_SECRET (obligatoria; ej: un uuid)
+# - FRONTEND_ORIGIN (opcional; ej: https://tuapp.netlify.app)
+# - ADMIN_SECRET (opcional para /admin/routes)
+# ---------------------------------------------
+
 import os
 import time
-from flask import request, jsonify
-from sqlalchemy import inspect, text
-import bcrypt  # si no lo usás, igual no molesta
-from collections import defaultdict
-from flask import Flask, jsonify, request, make_response
-from flask_sqlalchemy import SQLAlchemy
-from flask_cors import CORS
-from sqlalchemy import text, func
-import bcrypt, jwt
+from datetime import datetime, timedelta
 
-db = SQLAlchemy()
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+from flask_sqlalchemy import SQLAlchemy
+
+import bcrypt
+import jwt  # PyJWT
+
+# ------------------ Config básica ------------------
 
 def _normalize_db_url(raw: str) -> str:
     if not raw:
         return "sqlite:///local.db"
+    # Render suele dar postgres://, SQLAlchemy 2.x requiere postgresql+psycopg
     if raw.startswith("postgres://"):
         return raw.replace("postgres://", "postgresql+psycopg://", 1)
     if raw.startswith("postgresql://") and "+psycopg" not in raw:
         return raw.replace("postgresql://", "postgresql+psycopg://", 1)
     return raw
 
+DB_URL = _normalize_db_url(os.getenv("DATABASE_URL", "sqlite:///local.db"))
+JWT_SECRET = os.getenv("JWT_SECRET", "dev-inseguro-cambia-esto")
+ADMIN_SECRET = os.getenv("ADMIN_SECRET", "changeme-admin")
+FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN")  # ej: https://polite-gumdrop-ba6be7.netlify.app
+
 app = Flask(__name__)
-
-# === CORS ===
-FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "*")
-CORS(app, resources={
-    r"/docs": {"origins": "*"},
-    r"/openapi.json": {"origins": "*"},
-    r"/health": {"origins": "*"},
-    r"/*": {"origins": FRONTEND_ORIGIN}
-}, supports_credentials=False)
-
-url = _normalize_db_url(os.getenv("DATABASE_URL", "sqlite:///local.db"))
-app.config["SQLALCHEMY_DATABASE_URI"] = url
+app.config["SQLALCHEMY_DATABASE_URI"] = DB_URL
+app.config["SQLALCHEMY_ENGINE_OPTIONS"] = {"pool_pre_ping": True}
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
-JWT_SECRET = os.getenv("JWT_SECRET", "CÁMBIAME-POR-FAVOR")
-JWT_ALG = "HS256"
-JWT_EXP_MIN = int(os.getenv("JWT_EXP_MIN", "1440"))
-DEBUG_ERRORS = os.getenv("DEBUG_ERRORS", "0") == "1"
 
-db.init_app(app)
+# CORS: si definís FRONTEND_ORIGIN se permite solo ese; si no, *
+cors_origins = [FRONTEND_ORIGIN] if FRONTEND_ORIGIN else ["*"]
+CORS(app, resources={r"/*": {"origins": cors_origins, "supports_credentials": False}})
 
-# ===== MODELOS =====
+db = SQLAlchemy(app)
+
+# ------------------ Modelos ------------------
+
 class User(db.Model):
+    __tablename__ = "user"
     id = db.Column(db.Integer, primary_key=True)
-    email = db.Column(db.String(255), unique=True, nullable=False, index=True)
-    password_hash = db.Column(db.String(255), nullable=False)
-    creado_en = db.Column(db.DateTime, server_default=db.func.now())
+    email = db.Column(db.String(255), unique=True, nullable=False)
+    password_hash = db.Column(db.String(255), nullable=True)
+    creado_en = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
 
 class Cobro(db.Model):
+    __tablename__ = "cobro"
     id = db.Column(db.Integer, primary_key=True)
-    monto = db.Column(db.Float, nullable=False)
-    descripcion = db.Column(db.String(255))
-    referencia = db.Column(db.String(50))
-    estado = db.Column(db.String(20), nullable=False, default="pendiente")  # pendiente|pagado|cancelado
-    creado_en = db.Column(db.DateTime, server_default=db.func.now())
+    monto = db.Column(db.Float, nullable=False, default=0.0)
+    descripcion = db.Column(db.String(255), nullable=False, default="")
+    estado = db.Column(db.String(50), nullable=False, default="pendiente")  # pendiente | pagado
+    referencia = db.Column(db.String(100), nullable=True)
+    creado_en = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
 
-with app.app_context():
-    try:
+# ------------------ Utilidades ------------------
+
+def create_tables_once():
+    """Crea tablas si no existen."""
+    with app.app_context():
         db.create_all()
-    except Exception:
-        pass
 
-# ==== AUTH UTILS ====
-def _make_token(user_id: int, email: str) -> str:
-    now = datetime.datetime.utcnow()
-    payload = {"sub": str(user_id), "email": email, "iat": now, "exp": now + datetime.timedelta(minutes=JWT_EXP_MIN)}
-    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALG)
+def make_token(email: str) -> str:
+    payload = {
+        "sub": email,
+        "exp": datetime.utcnow() + timedelta(hours=12),
+        "iat": datetime.utcnow(),
+    }
+    return jwt.encode(payload, JWT_SECRET, algorithm="HS256")
 
-def _get_current_user():
-    auth = request.headers.get("Authorization", "")
-    if not auth.startswith("Bearer "):
+def read_token(auth_header: str) -> str | None:
+    """Devuelve email o None."""
+    if not auth_header or not auth_header.startswith("Bearer "):
         return None
-    token = auth.split(" ", 1)[1].strip()
+    token = auth_header.split(" ", 1)[1].strip()
     try:
-        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALG])
-        uid = int(payload.get("sub", "0"))
-        return User.query.get(uid)
+        data = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
+        return data.get("sub")
     except Exception:
         return None
 
-def _require_user():
-    user = _get_current_user()
-    if not user:
+def require_auth():
+    auth = request.headers.get("Authorization", "")
+    email = read_token(auth)
+    if not email:
         return None, (jsonify({"error": "no_autorizado"}), 401)
-    return user, None
+    u = User.query.filter_by(email=email).first()
+    if not u:
+        return None, (jsonify({"error": "no_autorizado"}), 401)
+    return u, None
 
-@app.before_request
-def _strict_origin():
-    if FRONTEND_ORIGIN == "*" or request.method == "OPTIONS":
-        return
-    path = request.path or ""
-    publico = path.startswith("/docs") or path.startswith("/openapi.json") or path.startswith("/health")
-    if publico:
-        return
-    origin = request.headers.get("Origin", "")
-    if origin and origin != FRONTEND_ORIGIN:
-        return jsonify({"error": "origin_no_permitido"}), 403
+# ------------------ Rutas sistema/health ------------------
 
-# ===== HEALTH =====
 @app.get("/health")
 def health():
-    ok_db = False
-    err = None
     try:
-        db.session.execute(text("SELECT 1"))
-        ok_db = True
-    except Exception as e:
-        err = str(e)
-    return jsonify({
-        "ok": ok_db,
-        "db": "on" if ok_db else "off",
-        "status": "healthy" if ok_db else "degraded",
-        "db_url_scheme": url.split(":")[0] if ":" in url else url,
-        "error": err
-    }), 200
-
-# ===== AUTH =====
-@app.post("/auth/register")
-def register():
-    data = request.get_json(silent=True) or {}
-    email = (data.get("email") or "").strip().lower()
-    password = (data.get("password") or "").strip()
-    if not email or not password:
-        return jsonify({"error": "faltan_campos"}), 400
-    if len(password) < 6:
-        return jsonify({"error": "password_corta"}), 400
-    try:
-        if User.query.filter_by(email=email).first():
-            return jsonify({"error": "email_ya_existe"}), 409
-        pw_hash = bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
-        u = User(email=email, password_hash=pw_hash)
-        db.session.add(u)
-        db.session.commit()
-        return jsonify({"id": u.id, "email": u.email}), 201
-    except Exception as e:
-        db.session.rollback()
-        msg = {"error": "db_error"};  msg["detail"] = str(e) if DEBUG_ERRORS else "db_fail"
-        return jsonify(msg), 500
-
-@app.post("/auth/login")
-def login():
-    try:
-        data = request.get_json(silent=True) or {}
-        email = (data.get("email") or "").strip().lower()
-        password = (data.get("password") or "").strip()
-        if not email or not password:
-            return jsonify({"error": "faltan_campos"}), 400
-
-        u = User.query.filter_by(email=email).first()
-        if not u:
-            return jsonify({"error": "credenciales_invalidas"}), 401
-
-    # si el usuario no tiene hash, tratar como credencial inválida
-    if not getattr(u, "password_hash", None):
-    except Exception as e:
-        # auto-fix: cerrar try sin except para que gunicorn no muera
-        pass
-    except Exception as e:
-        # Auto-fix: cierre de try sin except para evitar SyntaxError en Render
-        pass
-        return jsonify({"error":"credenciales_invalidas"}), 401
-        try:
-            ok = bcrypt.checkpw(password.encode("utf-8"), u.password_hash.encode("utf-8"))
-        except Exception as e:
-            msg = {"error": "bcrypt_error"}; msg["detail"] = str(e) if DEBUG_ERRORS else "bcrypt_fail"
-            return jsonify(msg), 500
-        if not ok:
-            return jsonify({"error": "credenciales_invalidas"}), 401
-
-        try:
-            token = _make_token(u.id, u.email)
-        except Exception as e:
-            msg = {"error": "jwt_error"}; msg["detail"] = str(e) if DEBUG_ERRORS else "jwt_fail"
-            return jsonify(msg), 500
-
-        return jsonify({"access_token": token, "token_type": "bearer"}), 200
-    except Exception as e:
-        msg = {"error": "login_exception"}; msg["detail"] = str(e) if DEBUG_ERRORS else "login_fail"
-        return jsonify(msg), 500
-
-# ===== HELPERS =====
-def _parse_int(value, default):
-    try:
-        v = int(value);  return v if v > 0 else default
-    except Exception:
-        return default
-
-def _parse_date(s):
-    if not s: return None
-    try: return datetime.datetime.strptime(s, "%Y-%m-%d")
-    except Exception: return None
-
-# ===== COBROS CRUD =====
-@app.get("/cobros")
-def get_cobros():
-    user, err = _require_user()
-    if err: return err
-    estado = request.args.get("estado", "", type=str).strip().lower()
-    desde_str = request.args.get("desde", "", type=str).strip()
-    hasta_str = request.args.get("hasta", "", type=str).strip()
-    page = _parse_int(request.args.get("page", 1), 1)
-    page_size = _parse_int(request.args.get("page_size", 20), 20)
-    if page_size > 100: page_size = 100
-
-    q = Cobro.query
-    if estado in ("pendiente", "pagado", "cancelado"):
-        q = q.filter(Cobro.estado == estado)
-    d_desde = _parse_date(desde_str)
-    d_hasta = _parse_date(hasta_str)
-    if d_desde: q = q.filter(Cobro.creado_en >= d_desde)
-    if d_hasta:
-        fin = d_hasta + datetime.timedelta(days=1) - datetime.timedelta(seconds=1)
-        q = q.filter(Cobro.creado_en <= fin)
-
-    total = q.count()
-    items = q.order_by(Cobro.id.desc()).offset((page-1)*page_size).limit(page_size).all()
-    return jsonify({
-        "page": page, "page_size": page_size, "total": total,
-        "items": [{
-            "id": c.id, "monto": float(c.monto) if c.monto is not None else 0.0,
-            "descripcion": c.descripcion, "referencia": c.referencia,
-            "estado": c.estado, "creado_en": c.creado_en.isoformat() if c.creado_en else None
-        } for c in items]
-    }), 200
-
-@app.post("/cobros")
-def crear_cobro():
-    user, err = _require_user()
-    if err: return err
-    data = request.get_json(silent=True) or {}
-    try:
-        monto = float(data.get("monto", 0))
-    except Exception:
-        return jsonify({"error": "monto_invalido"}), 400
-    if monto <= 0:
-        return jsonify({"error": "monto_debe_ser_positivo"}), 400
-    descripcion = (data.get("descripcion") or "").strip() or None
-    referencia = (data.get("referencia") or "").strip() or None
-    estado = (data.get("estado") or "pendiente").strip().lower()
-    if estado not in ("pendiente", "pagado", "cancelado"):
-        return jsonify({"error": "estado_invalido"}), 400
-    try:
-        db.create_all()
-        nuevo = Cobro(monto=monto, descripcion=descripcion, referencia=referencia, estado=estado)
-        db.session.add(nuevo)
-        db.session.commit()
-        return jsonify({
-            "id": nuevo.id, "monto": float(nuevo.monto),
-            "descripcion": nuevo.descripcion, "referencia": nuevo.referencia,
-            "estado": nuevo.estado, "creado_en": nuevo.creado_en.isoformat() if nuevo.creado_en else None
-        }), 201
-    except Exception as e:
-        db.session.rollback()
-        msg = {"error": "db_error"}; msg["detail"] = str(e) if DEBUG_ERRORS else "db_fail"
-        return jsonify(msg), 500
-
-@app.patch("/cobros/<int:cobro_id>")
-def actualizar_cobro(cobro_id: int):
-    user, err = _require_user()
-    if err: return err
-    data = request.get_json(silent=True) or {}
-    estado = data.get("estado")
-    descripcion = data.get("descripcion")
-    referencia = data.get("referencia")
-    if estado is None and descripcion is None and referencia is None:
-        return jsonify({"error": "nada_para_actualizar"}), 400
-    if estado is not None:
-        estado = str(estado).strip().lower()
-        if estado not in ("pendiente", "pagado", "cancelado"):
-            return jsonify({"error": "estado_invalido"}), 400
-    c = Cobro.query.get(cobro_id)
-    if not c: return jsonify({"error": "no_encontrado"}), 404
-    try:
-        if estado is not None: c.estado = estado
-        if descripcion is not None: c.descripcion = (descripcion or "").strip() or None
-        if referencia is not None: c.referencia = (referencia or "").strip() or None
-        db.session.commit()
-        return jsonify({
-            "id": c.id, "monto": float(c.monto),
-            "descripcion": c.descripcion, "referencia": c.referencia,
-            "estado": c.estado, "creado_en": c.creado_en.isoformat() if c.creado_en else None
-        }), 200
-    except Exception as e:
-        db.session.rollback()
-        msg = {"error": "db_error"}; msg["detail"] = str(e) if DEBUG_ERRORS else "db_fail"
-        return jsonify(msg), 500
-
-@app.delete("/cobros/<int:cobro_id>")
-def borrar_cobro(cobro_id: int):
-    user, err = _require_user()
-    if err: return err
-    c = Cobro.query.get(cobro_id)
-    if not c: return jsonify({"error": "no_encontrado"}), 404
-    try:
-        db.session.delete(c)
-        db.session.commit()
-        return jsonify({"ok": True, "id": cobro_id}), 200
-    except Exception as e:
-        db.session.rollback()
-        msg = {"error": "db_error"}; msg["detail"] = str(e) if DEBUG_ERRORS else "db_fail"
-        return jsonify(msg), 500
-
-# ===== EXPORT CSV =====
-@app.get("/cobros/export.csv")
-def export_cobros_csv():
-    user, err = _require_user()
-    if err: return err
-    estado = request.args.get("estado", "", type=str).strip().lower()
-    desde_str = request.args.get("desde", "", type=str).strip()
-    hasta_str = request.args.get("hasta", "", type=str).strip()
-
-    q = Cobro.query
-    if estado in ("pendiente", "pagado", "cancelado"):
-        q = q.filter(Cobro.estado == estado)
-    d_desde = _parse_date(desde_str)
-    d_hasta = _parse_date(hasta_str)
-    if d_desde: q = q.filter(Cobro.creado_en >= d_desde)
-    if d_hasta:
-        fin = d_hasta + datetime.timedelta(days=1) - datetime.timedelta(seconds=1)
-        q = q.filter(Cobro.creado_en <= fin)
-
-    rows = q.order_by(Cobro.id.desc()).all()
-
-    buf = io.StringIO()
-    w = csv.writer(buf)
-    w.writerow(["id", "monto", "descripcion", "referencia", "estado", "creado_en"])
-    for c in rows:
-        w.writerow([
-            c.id,
-            (float(c.monto) if c.monto is not None else 0.0),
-            (c.descripcion or ""),
-            (c.referencia or ""),
-            c.estado,
-            (c.creado_en.isoformat() if c.creado_en else "")
-        ])
-    out = make_response(buf.getvalue())
-    out.headers["Content-Type"] = "text/csv; charset=utf-8"
-    fname = f"cobros_{datetime.datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.csv"
-    out.headers["Content-Disposition"] = f'attachment; filename="{fname}"'
-    return out, 200
-
-# ===== STATS =====
-@app.get("/stats")
-def stats():
-    user, err = _require_user()
-    if err: return err
-    estado = request.args.get("estado", "", type=str).strip().lower()
-    desde_str = request.args.get("desde", "", type=str).strip()
-    hasta_str = request.args.get("hasta", "", type=str).strip()
-
-    q = Cobro.query
-    if estado in ("pendiente", "pagado", "cancelado"):
-        q = q.filter(Cobro.estado == estado)
-
-    d_desde = _parse_date(desde_str)
-    d_hasta = _parse_date(hasta_str)
-    if d_desde: q = q.filter(Cobro.creado_en >= d_desde)
-    if d_hasta:
-        fin = d_hasta + datetime.timedelta(days=1) - datetime.timedelta(seconds=1)
-        q = q.filter(Cobro.creado_en <= fin)
-
-    # Resumen general
-    cantidad = q.count()
-    monto_total = float(sum((c.monto or 0.0) for c in q.with_entities(Cobro.monto).all())) if cantidad else 0.0
-
-    # Totales por estado (si no filtraste por estado)
-    por_estado = {"pendiente": {"cantidad": 0, "monto": 0.0},
-                  "pagado": {"cantidad": 0, "monto": 0.0},
-                  "cancelado": {"cantidad": 0, "monto": 0.0}}
-    for row in q.with_entities(Cobro.estado, func.count(Cobro.id), func.sum(Cobro.monto)).group_by(Cobro.estado).all():
-        est = row[0] or ""
-        if est in por_estado:
-            por_estado[est]["cantidad"] = int(row[1] or 0)
-            por_estado[est]["monto"] = float(row[2] or 0.0)
-
-    # Totales por día (compatibles con SQLite y Postgres)
-    fecha_expr = func.date(Cobro.creado_en)  # funciona en ambos
-    por_dia_rows = (q.with_entities(fecha_expr.label("fecha"), func.count(Cobro.id), func.sum(Cobro.monto))
-                      .group_by("fecha").order_by("fecha").all())
-    por_dia = [{"fecha": str(r[0]), "cantidad": int(r[1] or 0), "monto": float(r[2] or 0.0)} for r in por_dia_rows]
-
-    return jsonify({
-        "filtros": {"estado": (estado if estado in ("pendiente","pagado","cancelado") else None),
-                    "desde": (d_desde.strftime("%Y-%m-%d") if d_desde else None),
-                    "hasta": (d_hasta.strftime("%Y-%m-%d") if d_hasta else None)},
-        "resumen": {"cantidad": int(cantidad), "monto_total": float(monto_total)},
-        "por_estado": por_estado,
-        "por_dia": por_dia
-    }), 200
-
-
-# ===== ADMIN: MIGRACIÓN PARA AGREGAR password_hash A "user" =====
-import os
-from sqlalchemy import inspect
-
-@app.post("/admin/migrate_user_password_hash")
-def migrate_user_password_hash():
-    # Protección sencilla con ADMIN_SECRET (env)
-    ADMIN_SECRET = os.getenv("ADMIN_SECRET", "")
-    if request.headers.get("X-Admin-Secret","") != ADMIN_SECRET or not ADMIN_SECRET:
-        return jsonify({"error":"no_autorizado"}), 401
-    try:
-        insp = inspect(db.engine)
-        cols = {c['name'] for c in insp.get_columns('user')}
-        changed = False
-        if "password_hash" not in cols:
-            # Agregar columna null primero (para no romper filas viejas)
-            db.session.execute(text('ALTER TABLE "user" ADD COLUMN password_hash VARCHAR(255)'))
-            changed = True
-        db.session.commit()
-        return jsonify({"ok": True, "changed": changed}), 200
-    except Exception as e:
-        db.session.rollback()
-        return jsonify({"error":"db_error","detail":str(e)}), 500
-
-# ===== ADMIN: BACKFILL PASSWORDS PARA USUARIOS SIN HASH =====
-from sqlalchemy import inspect
-
-@app.post("/admin/backfill_user_passwords")
-def backfill_user_passwords():
-    ADMIN_SECRET = os.getenv("ADMIN_SECRET", "")
-    if request.headers.get("X-Admin-Secret","") != ADMIN_SECRET or not ADMIN_SECRET:
-        return jsonify({"error":"no_autorizado"}), 401
-    data = request.get_json(silent=True) or {}
-    temp_password = (data.get("temp_password") or os.getenv("ADMIN_TEMP_PASSWORD") or "Noa2025!").strip()
-    if len(temp_password) < 6:
-        return jsonify({"error":"temp_password_corto"}), 400
-    try:
-        # Usuarios con password_hash NULL o vacío
-        res = db.session.execute(text('SELECT id, email, password_hash FROM "user"'))
-        to_fix = [r[0] for r in res if not r[2]]
-        fixed = 0
-        if to_fix:
-            pw_hash = bcrypt.hashpw(temp_password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
-            for uid in to_fix:
-                db.session.execute(text('UPDATE "user" SET password_hash = :h WHERE id = :i'), {"h": pw_hash, "i": uid})
-            db.session.commit()
-            fixed = len(to_fix)
-        return jsonify({"ok": True, "fixed": fixed, "temp_password_len": len(temp_password)}), 200
-    except Exception as e:
-        db.session.rollback()
-        return jsonify({"error":"db_error","detail":str(e)}), 500
-
-# ===== ADMIN: MIGRACIÓN COLUMNA USER (password_hash + creado_en) =====
-from sqlalchemy import inspect
-
-@app.post("/admin/migrate_user_columns")
-def migrate_user_columns():
-    ADMIN_SECRET = os.getenv("ADMIN_SECRET", "")
-    if request.headers.get("X-Admin-Secret","") != ADMIN_SECRET or not ADMIN_SECRET:
-        return jsonify({"error":"no_autorizado"}), 401
-    try:
-        insp = inspect(db.engine)
-        cols = {c['name'] for c in insp.get_columns('user')}
-        changed = {"password_hash": False, "creado_en": False, "backfill_creado_en": False}
-
-        # 1) password_hash si falta
-        if "password_hash" not in cols:
-            db.session.execute(text('ALTER TABLE "user" ADD COLUMN password_hash VARCHAR(255)'))
-            changed["password_hash"] = True
-
-        # 2) creado_en si falta (sin zona horaria para compatibilidad)
-        if "creado_en" not in cols:
-            db.session.execute(text('ALTER TABLE "user" ADD COLUMN creado_en TIMESTAMP'))
-            # Rellenar existentes con NOW()
-            db.session.execute(text('UPDATE "user" SET creado_en = NOW() WHERE creado_en IS NULL'))
-            changed["creado_en"] = True
-            changed["backfill_creado_en"] = True
-        else:
-            # Si existe pero hay NULLs, backfill
-            db.session.execute(text('UPDATE "user" SET creado_en = NOW() WHERE creado_en IS NULL'))
-            # Saber si realmente tocó filas:
-            # (No siempre es trivial contar aquí sin otra query; lo dejamos informativo)
-            changed["backfill_creado_en"] = True
-
-        db.session.commit()
-        return jsonify({"ok": True, "changed": changed}), 200
-    except Exception as e:
-        db.session.rollback()
-        return jsonify({"error":"db_error","detail":str(e)}), 500
-
-# ===== ADMIN: LISTAR RUTAS =====
-@app.get("/admin/routes")
-def admin_routes():
-    ADMIN_SECRET = os.getenv("ADMIN_SECRET", "")
-    if request.headers.get("X-Admin-Secret","") != ADMIN_SECRET or not ADMIN_SECRET:
-        return jsonify({"error":"no_autorizado"}), 401
-    rutas = []
-    for r in app.url_map.iter_rules():
-        rutas.append({"rule": str(r), "endpoint": r.endpoint, "methods": sorted(m for m in r.methods if m not in ("HEAD","OPTIONS"))})
-    return jsonify({"ok": True, "count": len(rutas), "routes": rutas}), 200
-
-# ===== PUBLIC: __ok (diagnóstico live) =====
-@app.get("/__ok")
-def __ok():
-    try:
-        routes = [str(r) for r in app.url_map.iter_rules()]
-        has_stats = any("/stats" in r for r in routes)
+        # ping DB rapidito
+        db.session.execute(db.text("SELECT 1"))
         return jsonify({
             "ok": True,
-            "has_stats": has_stats,
-            "routes_count": len(routes),
-            "version": os.getenv("APP_VERSION", "") or str(int(time.time()))
+            "db": "on",
+            "db_url_scheme": DB_URL.split(":", 1)[0],
+            "error": None
         }), 200
     except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
-
-# ===== ADMIN: FIX TABLA USER (password_hash + creado_en) =====
-@app.post("/admin/fix_user_table")
-def admin_fix_user_table():
-    ADMIN_SECRET = os.getenv("ADMIN_SECRET","")
-    if request.headers.get("X-Admin-Secret","") != ADMIN_SECRET or not ADMIN_SECRET:
-        return jsonify({"error":"no_autorizado"}), 401
-    try:
-        # Crear columnas si faltan (idempotente)
-        db.session.execute(text('ALTER TABLE "user" ADD COLUMN IF NOT EXISTS password_hash VARCHAR(255)'))
-        db.session.execute(text('ALTER TABLE "user" ADD COLUMN IF NOT EXISTS creado_en TIMESTAMP'))
-        # Backfill creado_en
-        db.session.execute(text('UPDATE "user" SET creado_en = NOW() WHERE creado_en IS NULL'))
-        db.session.commit()
-        # Controles: contar NULLs pendientes
-        res = db.session.execute(text('SELECT count(*) FROM "user" WHERE password_hash IS NULL OR password_hash = \'\''))
-        null_pw = res.scalar() or 0
-        res = db.session.execute(text('SELECT count(*) FROM "user" WHERE creado_en IS NULL'))
-        null_ce = res.scalar() or 0
-        return jsonify({"ok": True, "null_password_hash": null_pw, "null_creado_en": null_ce}), 200
-    except Exception as e:
-        db.session.rollback()
-        return jsonify({"error":"db_error","detail":str(e)}), 500
-
-# ===== ADMIN: VER ESQUEMA USER =====
-@app.get("/admin/user_schema")
-def admin_user_schema():
-    ADMIN_SECRET = os.getenv("ADMIN_SECRET","")
-    if request.headers.get("X-Admin-Secret","") != ADMIN_SECRET or not ADMIN_SECRET:
-        return jsonify({"error":"no_autorizado"}), 401
-    try:
-        cols = []
-        for c in db.engine.dialect.get_columns(db.engine.connect(), 'user'):
-            cols.append({"name": c.get("name"), "type": str(c.get("type")), "nullable": c.get("nullable")})
-        # Fallback si dialect.get_columns no está: usa reflexión de SQL
-    except Exception:
-        from sqlalchemy import inspect
-        insp = inspect(db.engine)
-        cols = [{"name": c["name"], "type": str(c.get("type")), "nullable": c.get("nullable")} for c in insp.get_columns('user')]
-    return jsonify({"ok": True, "columns": cols}), 200
-
-# ===== OPENAPI (mínimo) =====
-@app.get("/openapi.json")
-def openapi_json():
-    return jsonify({"openapi":"3.0.3","info":{"title":"NOA Cobros","version":"1.2.0"},
-                    "paths":{"health":{},"auth/login":{},"cobros":{},"stats":{} }})
-
-@app.get("/docs")
-def docs():
-    return make_response("<h1>NOA Cobros Docs</h1><p>Ver /openapi.json</p>", 200)
-    # =========================
-# ADMIN / HEALTH ENDPOINTS
-# =========================
-
-# --- PÚBLICO: __ok (diagnóstico) ---
-@app.get("/__ok")
-def __ok():
-    try:
-        rutas = [str(r) for r in app.url_map.iter_rules()]
-        has_stats = any("/stats" in r for r in rutas)
-        return jsonify({
-            "ok": True,
-            "has_stats": has_stats,
-            "routes_count": len(rutas),
-            "version": os.getenv("APP_VERSION", "") or str(int(time.time()))
-        }), 200
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
-
-
-# --- ADMIN: listar rutas reales (protegido) ---
-@app.get("/admin/routes")
-def admin_routes():
-    ADMIN_SECRET = os.getenv("ADMIN_SECRET", "")
-    if request.headers.get("X-Admin-Secret", "") != ADMIN_SECRET or not ADMIN_SECRET:
-        return jsonify({"error": "no_autorizado"}), 401
-    try:
-        rutas = []
-        for r in app.url_map.iter_rules():
-            rutas.append({
-                "rule": str(r),
-                "endpoint": r.endpoint,
-                "methods": sorted(m for m in r.methods if m not in ("HEAD", "OPTIONS"))
-            })
-        return jsonify({"ok": True, "count": len(rutas), "routes": rutas}), 200
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
-
-
-# --- ADMIN: crear columnas que faltan (password_hash, creado_en) ---
-@app.post("/admin/migrate_user_columns")
-def migrate_user_columns():
-    ADMIN_SECRET = os.getenv("ADMIN_SECRET", "")
-    if request.headers.get("X-Admin-Secret", "") != ADMIN_SECRET or not ADMIN_SECRET:
-        return jsonify({"error": "no_autorizado"}), 401
-    try:
-        insp = inspect(db.engine)
-        cols = {c['name'] for c in insp.get_columns('user')}
-        changed = {"password_hash": False, "creado_en": False, "backfill_creado_en": False}
-
-        if "password_hash" not in cols:
-            db.session.execute(text('ALTER TABLE "user" ADD COLUMN password_hash VARCHAR(255)'))
-            changed["password_hash"] = True
-
-        if "creado_en" not in cols:
-            db.session.execute(text('ALTER TABLE "user" ADD COLUMN creado_en TIMESTAMP'))
-            db.session.execute(text('UPDATE "user" SET creado_en = NOW() WHERE creado_en IS NULL'))
-            changed["creado_en"] = True
-            changed["backfill_creado_en"] = True
-        else:
-            db.session.execute(text('UPDATE "user" SET creado_en = NOW() WHERE creado_en IS NULL'))
-            changed["backfill_creado_en"] = True
-
-        db.session.commit()
-        return jsonify({"ok": True, "changed": changed}), 200
-    except Exception as e:
-        db.session.rollback()
-        return jsonify({"error": "db_error", "detail": str(e)}), 500
-
-
-# --- ADMIN: poner password hash temporal a usuarios sin hash ---
-@app.post("/admin/backfill_user_passwords")
-def backfill_user_passwords():
-    ADMIN_SECRET = os.getenv("ADMIN_SECRET", "")
-    if request.headers.get("X-Admin-Secret", "") != ADMIN_SECRET or not ADMIN_SECRET:
-        return jsonify({"error": "no_autorizado"}), 401
-    try:
-        data = request.get_json(silent=True) or {}
-        temp_password = (data.get("temp_password") or os.getenv("ADMIN_TEMP_PASSWORD") or "Noa2025!").strip()
-        if len(temp_password) < 6:
-            return jsonify({"error": "temp_password_corto"}), 400
-
-        # Buscar usuarios sin hash
-        rows = db.session.execute(text('SELECT id, email, password_hash FROM "user"')).fetchall()
-        to_fix = [r[0] for r in rows if not r[2]]
-
-        fixed = 0
-        if to_fix:
-            pw_hash = bcrypt.hashpw(temp_password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
-            for uid in to_fix:
-                db.session.execute(text('UPDATE "user" SET password_hash = :h WHERE id = :i'),
-                                   {"h": pw_hash, "i": uid})
-            db.session.commit()
-            fixed = len(to_fix)
-
-        return jsonify({"ok": True, "fixed": fixed}), 200
-    except Exception as e:
-        db.session.rollback()
-        return jsonify({"error": "db_error", "detail": str(e)}), 500
-
-
-# --- ADMIN: fix combinado (idempotente) ---
-@app.post("/admin/fix_user_table")
-def admin_fix_user_table():
-    ADMIN_SECRET = os.getenv("ADMIN_SECRET", "")
-    if request.headers.get("X-Admin-Secret", "") != ADMIN_SECRET or not ADMIN_SECRET:
-        return jsonify({"error": "no_autorizado"}), 401
-    try:
-        db.session.execute(text('ALTER TABLE "user" ADD COLUMN IF NOT EXISTS password_hash VARCHAR(255)'))
-        db.session.execute(text('ALTER TABLE "user" ADD COLUMN IF NOT EXISTS creado_en TIMESTAMP'))
-        db.session.execute(text('UPDATE "user" SET creado_en = NOW() WHERE creado_en IS NULL'))
-        db.session.commit()
-
-        null_pw = db.session.execute(
-            text('SELECT count(*) FROM "user" WHERE password_hash IS NULL OR password_hash = \'\'')
-        ).scalar() or 0
-        null_ce = db.session.execute(
-            text('SELECT count(*) FROM "user" WHERE creado_en IS NULL')
-        ).scalar() or 0
-
-        return jsonify({"ok": True, "null_password_hash": null_pw, "null_creado_en": null_ce}), 200
-    except Exception as e:
-        db.session.rollback()
-        return jsonify({"error": "db_error", "detail": str(e)}), 500
-
-
-# --- ADMIN: ver columnas reales de la tabla user ---
-@app.get("/admin/user_schema")
-def admin_user_schema():
-    ADMIN_SECRET = os.getenv("ADMIN_SECRET", "")
-    if request.headers.get("X-Admin-Secret", "") != ADMIN_SECRET or not ADMIN_SECRET:
-        return jsonify({"error": "no_autorizado"}), 401
-    try:
-        try:
-            # Intento 1: dialect.get_columns
-            cols = []
-            with db.engine.connect() as conn:
-                for c in db.engine.dialect.get_columns(conn, 'user'):
-                    cols.append({
-                        "name": c.get("name"),
-                        "type": str(c.get("type")),
-                        "nullable": c.get("nullable")
-                    })
-        except Exception:
-            # Intento 2: inspector
-            insp = inspect(db.engine)
-            cols = [{"name": c["name"], "type": str(c.get("type")), "nullable": c.get("nullable")}
-                    for c in insp.get_columns('user')]
-        return jsonify({"ok": True, "columns": cols}), 200
-    except Exception as e:
-        return jsonify({"error": "db_error", "detail": str(e)}), 500
-        # ===== NOA: health y rutas de diagnóstico =====
-import time, os
-from flask import jsonify, request
+        return jsonify({"ok": False, "db": "off", "error": str(e)}), 200
 
 @app.get("/__ok")
 def __ok():
@@ -727,4 +130,187 @@ def __ok():
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
+@app.get("/admin/routes")
+def admin_routes():
+    if request.headers.get("X-Admin-Secret") != ADMIN_SECRET:
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+    routes = []
+    for r in app.url_map.iter_rules():
+        routes.append({
+            "rule": str(r),
+            "methods": sorted(list(r.methods - {"HEAD", "OPTIONS"}))
+        })
+    return jsonify({"ok": True, "count": len(routes), "routes": routes})
 
+# ------------------ Auth ------------------
+
+@app.post("/auth/register")
+def register():
+    data = request.get_json(silent=True) or {}
+    email = (data.get("email") or "").strip().lower()
+    password = data.get("password") or ""
+    if not email or not password:
+        return jsonify({"error": "faltan_datos"}), 400
+
+    if User.query.filter_by(email=email).first():
+        return jsonify({"ok": True, "detail": "ya_existe"}), 200
+
+    try:
+        pw_hash = bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+        u = User(email=email, password_hash=pw_hash)
+        db.session.add(u)
+        db.session.commit()
+        return jsonify({"ok": True, "id": u.id, "email": u.email}), 201
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": "db_error", "detail": str(e)}), 500
+
+@app.post("/auth/login")
+def login():
+    data = request.get_json(silent=True) or {}
+    email = (data.get("email") or "").strip().lower()
+    password = data.get("password") or ""
+    if not email or not password:
+        return jsonify({"error": "faltan_datos"}), 400
+
+    u = User.query.filter_by(email=email).first()
+    if not u:
+        return jsonify({"error": "credenciales_invalidas"}), 401
+
+    if not getattr(u, "password_hash", None):
+        return jsonify({"error": "credenciales_invalidas"}), 401
+
+    try:
+        ok = bcrypt.checkpw(password.encode("utf-8"), u.password_hash.encode("utf-8"))
+    except Exception as e:
+        msg = {"error": "bcrypt_error", "detail": str(e)}
+        return jsonify(msg), 500
+
+    if not ok:
+        return jsonify({"error": "credenciales_invalidas"}), 401
+
+    token = make_token(email)
+    return jsonify({"access_token": token, "token_type": "bearer"}), 200
+
+# ------------------ Usuarios ------------------
+
+@app.get("/users")
+def list_users():
+    u, err = require_auth()
+    if err:
+        return err
+    # lista corta
+    items = [{"id": x.id, "email": x.email} for x in User.query.order_by(User.id.asc()).limit(10).all()]
+    # si está vacío, devolvemos demo-user para que el FE no muera
+    if not items:
+        items = [{"id": 1, "email": "demo@noa.com"}]
+    return jsonify(items), 200
+
+# ------------------ Cobros ------------------
+
+@app.get("/cobros")
+def cobros_list():
+    u, err = require_auth()
+    if err:
+        return err
+
+    q = Cobro.query
+
+    estado = request.args.get("estado")
+    if estado:
+        q = q.filter(Cobro.estado == estado)
+
+    desde = request.args.get("desde")
+    hasta = request.args.get("hasta")
+    if desde:
+        try:
+            d = datetime.fromisoformat(desde)
+            q = q.filter(Cobro.creado_en >= d)
+        except Exception:
+            pass
+    if hasta:
+        try:
+            h = datetime.fromisoformat(hasta)
+            q = q.filter(Cobro.creado_en <= h)
+        except Exception:
+            pass
+
+    q = q.order_by(Cobro.id.desc())
+    items = [{
+        "id": x.id,
+        "monto": float(x.monto or 0.0),
+        "descripcion": x.descripcion,
+        "estado": x.estado,
+        "referencia": x.referencia,
+        "creado_en": x.creado_en.isoformat()
+    } for x in q.all()]
+    return jsonify(items), 200
+
+@app.post("/cobros")
+def cobros_create():
+    u, err = require_auth()
+    if err:
+        return err
+    data = request.get_json(silent=True) or {}
+    try:
+        c = Cobro(
+            monto=float(data.get("monto") or 0.0),
+            descripcion=(data.get("descripcion") or "").strip(),
+            estado=(data.get("estado") or "pendiente").strip(),
+            referencia=(data.get("referencia") or None)
+        )
+        db.session.add(c)
+        db.session.commit()
+        return jsonify({
+            "id": c.id, "monto": c.monto, "descripcion": c.descripcion,
+            "estado": c.estado, "referencia": c.referencia,
+            "creado_en": c.creado_en.isoformat()
+        }), 201
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": "db_error", "detail": str(e)}), 500
+
+# ------------------ Stats ------------------
+
+@app.get("/stats")
+def stats():
+    u, err = require_auth()
+    if err:
+        return err
+
+    q = Cobro.query
+    desde = request.args.get("desde")
+    hasta = request.args.get("hasta")
+    estado = request.args.get("estado")
+
+    if desde:
+        try:
+            d = datetime.fromisoformat(desde)
+            q = q.filter(Cobro.creado_en >= d)
+        except Exception:
+            pass
+    if hasta:
+        try:
+            h = datetime.fromisoformat(hasta)
+            q = q.filter(Cobro.creado_en <= h)
+        except Exception:
+            pass
+    if estado:
+        q = q.filter(Cobro.estado == estado)
+
+    items = q.all()
+    total = sum(float(x.monto or 0.0) for x in items)
+    count = len(items)
+    pagados = sum(1 for x in items if x.estado == "pagado")
+    pendientes = sum(1 for x in items if x.estado == "pendiente")
+
+    return jsonify({
+        "count": count,
+        "total": total,
+        "pagados": pagados,
+        "pendientes": pendientes
+    }), 200
+
+# ------------------ Arranque ------------------
+
+create_tables_once()
