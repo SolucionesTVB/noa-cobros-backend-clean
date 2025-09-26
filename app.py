@@ -1,4 +1,4 @@
-# app.py — NOA Cobros (backend limpio y completo, SIN parches)
+# app.py — NOA Cobros (backend limpio y completo)
 # ---------------------------------------------
 # Requiere: Flask, Flask-Cors, SQLAlchemy, psycopg[binary], bcrypt, PyJWT
 # Env:
@@ -303,7 +303,7 @@ def stats():
     total = sum(float(x.monto or 0.0) for x in items)
     count = len(items)
     pagados = sum(1 for x in items if x.estado == "pagado")
-    pendientes = sum(1 for x in items si x.estado == "pendiente")  # noqa
+    pendientes = sum(1 for x in items if x.estado == "pendiente")
 
     return jsonify({"count": count, "total": total, "pagados": pagados, "pendientes": pendientes}), 200
 
