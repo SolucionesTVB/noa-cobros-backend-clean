@@ -1,11 +1,11 @@
-# app.py — NOA Cobros (limpio)
+# app.py — NOA Cobros (backend limpio y completo)
 # ---------------------------------------------
-# Requisitos: Flask, Flask-Cors, SQLAlchemy, psycopg[binary], bcrypt, PyJWT
-# Variables de entorno usadas:
-# - DATABASE_URL (Render la pone)
-# - JWT_SECRET (obligatoria; ej: un uuid)
-# - FRONTEND_ORIGIN (opcional; ej: https://tuapp.netlify.app)
-# - ADMIN_SECRET (opcional para /admin/routes)
+# Requiere: Flask, Flask-Cors, SQLAlchemy, psycopg[binary], bcrypt, PyJWT
+# Vars de entorno:
+#   DATABASE_URL       (Render la pone)
+#   JWT_SECRET         (obligatoria)
+#   ADMIN_SECRET       (para /admin/routes)
+#   FRONTEND_ORIGIN    (opcional: ej https://polite-gumdrop-ba6be7.netlify.app)
 # ---------------------------------------------
 
 import os
@@ -15,16 +15,16 @@ from datetime import datetime, timedelta
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from flask_sqlalchemy import SQLAlchemy
+from sqlalchemy import text  # ← para migrador simple
 
 import bcrypt
 import jwt  # PyJWT
 
-# ------------------ Config básica ------------------
+# ------------------ Config ------------------
 
 def _normalize_db_url(raw: str) -> str:
     if not raw:
         return "sqlite:///local.db"
-    # Render suele dar postgres://, SQLAlchemy 2.x requiere postgresql+psycopg
     if raw.startswith("postgres://"):
         return raw.replace("postgres://", "postgresql+psycopg://", 1)
     if raw.startswith("postgresql://") and "+psycopg" not in raw:
@@ -41,9 +41,7 @@ app.config["SQLALCHEMY_DATABASE_URI"] = DB_URL
 app.config["SQLALCHEMY_ENGINE_OPTIONS"] = {"pool_pre_ping": True}
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 
-# CORS: si definís FRONTEND_ORIGIN se permite solo ese; si no, *
-cors_origins = [FRONTEND_ORIGIN] if FRONTEND_ORIGIN else ["*"]
-CORS(app, resources={r"/*": {"origins": cors_origins, "supports_credentials": False}})
+CORS(app, resources={r"/*": {"origins": [FRONTEND_ORIGIN] if FRONTEND_ORIGIN else ["*"]}})
 
 db = SQLAlchemy(app)
 
@@ -61,27 +59,33 @@ class Cobro(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     monto = db.Column(db.Float, nullable=False, default=0.0)
     descripcion = db.Column(db.String(255), nullable=False, default="")
-    estado = db.Column(db.String(50), nullable=False, default="pendiente")  # pendiente | pagado
+    estado = db.Column(db.String(50), nullable=False, default="pendiente")  # pendiente|pagado
     referencia = db.Column(db.String(100), nullable=True)
     creado_en = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
 
-# ------------------ Utilidades ------------------
+# ------------------ Helpers ------------------
+
+def ensure_user_columns():
+    """Mini-migrador: agrega columnas faltantes en tabla user (instalaciones viejas)."""
+    with app.app_context():
+        try:
+            db.session.execute(text('ALTER TABLE "user" ADD COLUMN IF NOT EXISTS password_hash VARCHAR(255);'))
+            db.session.execute(text('ALTER TABLE "user" ADD COLUMN IF NOT EXISTS creado_en TIMESTAMP WITHOUT TIME ZONE DEFAULT NOW();'))
+            db.session.commit()
+        except Exception as e:
+            db.session.rollback()
+            app.logger.error(f"ensure_user_columns error: {e}")
 
 def create_tables_once():
-    """Crea tablas si no existen."""
     with app.app_context():
         db.create_all()
+        ensure_user_columns()
 
 def make_token(email: str) -> str:
-    payload = {
-        "sub": email,
-        "exp": datetime.utcnow() + timedelta(hours=12),
-        "iat": datetime.utcnow(),
-    }
+    payload = {"sub": email, "exp": datetime.utcnow() + timedelta(hours=12), "iat": datetime.utcnow()}
     return jwt.encode(payload, JWT_SECRET, algorithm="HS256")
 
-def read_token(auth_header: str) -> str | None:
-    """Devuelve email o None."""
+def read_token(auth_header: str):
     if not auth_header or not auth_header.startswith("Bearer "):
         return None
     token = auth_header.split(" ", 1)[1].strip()
@@ -92,8 +96,7 @@ def read_token(auth_header: str) -> str | None:
         return None
 
 def require_auth():
-    auth = request.headers.get("Authorization", "")
-    email = read_token(auth)
+    email = read_token(request.headers.get("Authorization", ""))
     if not email:
         return None, (jsonify({"error": "no_autorizado"}), 401)
     u = User.query.filter_by(email=email).first()
@@ -101,19 +104,13 @@ def require_auth():
         return None, (jsonify({"error": "no_autorizado"}), 401)
     return u, None
 
-# ------------------ Rutas sistema/health ------------------
+# ------------------ Health / Admin ------------------
 
 @app.get("/health")
 def health():
     try:
-        # ping DB rapidito
-        db.session.execute(db.text("SELECT 1"))
-        return jsonify({
-            "ok": True,
-            "db": "on",
-            "db_url_scheme": DB_URL.split(":", 1)[0],
-            "error": None
-        }), 200
+        db.session.execute(text("SELECT 1"))
+        return jsonify({"ok": True, "db": "on", "db_url_scheme": DB_URL.split(":", 1)[0]}), 200
     except Exception as e:
         return jsonify({"ok": False, "db": "off", "error": str(e)}), 200
 
@@ -134,12 +131,7 @@ def __ok():
 def admin_routes():
     if request.headers.get("X-Admin-Secret") != ADMIN_SECRET:
         return jsonify({"ok": False, "error": "forbidden"}), 403
-    routes = []
-    for r in app.url_map.iter_rules():
-        routes.append({
-            "rule": str(r),
-            "methods": sorted(list(r.methods - {"HEAD", "OPTIONS"}))
-        })
+    routes = [{"rule": str(r), "methods": sorted(list(r.methods - {"HEAD", "OPTIONS"}))} for r in app.url_map.iter_rules()]
     return jsonify({"ok": True, "count": len(routes), "routes": routes})
 
 # ------------------ Auth ------------------
@@ -183,8 +175,7 @@ def login():
     try:
         ok = bcrypt.checkpw(password.encode("utf-8"), u.password_hash.encode("utf-8"))
     except Exception as e:
-        msg = {"error": "bcrypt_error", "detail": str(e)}
-        return jsonify(msg), 500
+        return jsonify({"error": "bcrypt_error", "detail": str(e)}), 500
 
     if not ok:
         return jsonify({"error": "credenciales_invalidas"}), 401
@@ -192,16 +183,14 @@ def login():
     token = make_token(email)
     return jsonify({"access_token": token, "token_type": "bearer"}), 200
 
-# ------------------ Usuarios ------------------
+# ------------------ Users ------------------
 
 @app.get("/users")
 def list_users():
     u, err = require_auth()
     if err:
         return err
-    # lista corta
     items = [{"id": x.id, "email": x.email} for x in User.query.order_by(User.id.asc()).limit(10).all()]
-    # si está vacío, devolvemos demo-user para que el FE no muera
     if not items:
         items = [{"id": 1, "email": "demo@noa.com"}]
     return jsonify(items), 200
@@ -304,13 +293,8 @@ def stats():
     pagados = sum(1 for x in items if x.estado == "pagado")
     pendientes = sum(1 for x in items if x.estado == "pendiente")
 
-    return jsonify({
-        "count": count,
-        "total": total,
-        "pagados": pagados,
-        "pendientes": pendientes
-    }), 200
+    return jsonify({"count": count, "total": total, "pagados": pagados, "pendientes": pendientes}), 200
 
-# ------------------ Arranque ------------------
+# ------------------ Boot ------------------
 
 create_tables_once()
