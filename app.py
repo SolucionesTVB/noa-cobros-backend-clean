@@ -15,7 +15,7 @@ from datetime import datetime, timedelta
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from flask_sqlalchemy import SQLAlchemy
-from sqlalchemy import text  # ← para migrador simple
+from sqlalchemy import text
 
 import bcrypt
 import jwt  # PyJWT
