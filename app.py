@@ -1,4 +1,4 @@
-# app.py — NOA Cobros (backend limpio)
+# app.py — noa cobros (backend limpio)
 import os, time
 from datetime import datetime, timedelta
 from flask import Flask, request, jsonify
@@ -21,6 +21,31 @@ ADMIN_SECRET = os.getenv("ADMIN_SECRET", "changeme-admin")
 FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN")
 
 app = Flask(__name__)
+# ==== CORS (Netlify) ====
+import os
+from flask_cors import CORS
+
+NETLIFY = os.getenv("FRONTEND_ORIGIN", "").strip() or "https://polite-gumdrop-ba6be7.netlify.app"
+
+CORS(
+    app,
+    resources={r"/*": {"origins": [NETLIFY]}},
+    supports_credentials=False,
+    expose_headers=["Content-Disposition"],
+    methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization"],
+)
+
+@app.after_request
+def _add_cors_headers(resp):
+    # Refuerzo por si algún endpoint se salta CORS
+    resp.headers.setdefault("Access-Control-Allow-Origin", NETLIFY)
+    resp.headers.setdefault("Vary", "Origin")
+    resp.headers.setdefault("Access-Control-Allow-Headers", "Content-Type, Authorization")
+    resp.headers.setdefault("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
+    return resp
+# ==== FIN CORS ====
+
 app.config["SQLALCHEMY_DATABASE_URI"] = DB_URL
 app.config["SQLALCHEMY_ENGINE_OPTIONS"] = {"pool_pre_ping": True}
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
