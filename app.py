@@ -249,3 +249,39 @@ def stats():
     return jsonify({"count": count, "total": total, "pagados": pagados, "pendientes": pendientes}), 200
 
 create_tables_once()
+# POST|PATCH /cobros/<id>/cobrar  (requiere token)
+@app.route("/cobros/<int:cobro_id>/cobrar", methods=["POST","PATCH"])
+def cobros_cobrar(cobro_id: int):
+    u, err = require_auth()
+    if err: return err
+    c = Cobro.query.get(cobro_id)
+    if not c:
+        return jsonify({"error": "no_encontrado"}), 404
+    c.estado = "pagado"
+    db.session.commit()
+    return jsonify({
+        "id": c.id, "monto": float(c.monto or 0.0), "descripcion": c.descripcion,
+        "estado": c.estado, "referencia": c.referencia, "creado_en": c.creado_en.isoformat()
+    }), 200
+
+# GET /cobros/export (CSV, requiere token)
+@app.get("/cobros/export")
+def cobros_export():
+    u, err = require_auth()
+    if err: return err
+    import io, csv
+    cols = ["id","descripcion","monto","estado","referencia","creado_en"]
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(cols)
+    for x in Cobro.query.order_by(Cobro.id.desc()).all():
+        w.writerow([x.id, x.descripcion, float(x.monto or 0.0), x.estado, x.referencia or "", x.creado_en.isoformat()])
+    return Response(
+        buf.getvalue(),
+        status=200,
+        headers={
+            "Content-Type": "text/csv; charset=utf-8",
+            "Content-Disposition": "attachment; filename=export_cobros.csv"
+        }
+    )
+
